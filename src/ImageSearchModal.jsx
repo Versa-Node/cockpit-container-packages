@@ -21,6 +21,7 @@ import './ImageSearchModal.css';
 const _ = cockpit.gettext;
 
 // ---------- GHCR helpers ----------
+const GH_ORG = "Versa-Node";
 const GHCR_NAMESPACE = "ghcr.io/versanode/";
 
 const isGhcr = (reg) => (reg || "").trim().toLowerCase() === "ghcr.io";
@@ -37,24 +38,31 @@ const buildGhcrVersanodeName = (txt) => {
   return (GHCR_NAMESPACE + t).replace(/\/+$/, "");
 };
 
-// ---------- DEV ONLY: hard-coded PAT listing for GHCR org ----------
-// Do NOT ship this. Move to a server-side proxy or cockpit.spawn with a root-owned file.
-const GH_ORG = "Versa-Node";
-const GH_TOKEN = "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";
-async function fetchGhcrOrgPackagesDev() {
-  const resp = await fetch(
-    `https://api.github.com/orgs/${GH_ORG}/packages?package_type=container&per_page=100`,
-    {
-      headers: {
-        Accept: "application/vnd.github+json",
-        Authorization: `Bearer ${GH_TOKEN}`,
-      },
-    }
-  );
-  if (!resp.ok) throw new Error(`GitHub API ${resp.status}: ${await resp.text()}`);
-  const packages = await resp.json();
-  // Map to your DataList item shape (lowercase keys)
-  return (packages || []).map(p => ({
+// server-side (host) fetch via cockpit.spawn (avoids CSP)
+// reads PAT from /etc/versanode/github.token if present (0600)
+async function fetchGhcrOrgPackagesViaSpawn() {
+  const script = `
+set -eo pipefail
+URL="https://api.github.com/orgs/${GH_ORG}/packages?package_type=container&per_page=100"
+HDR_ACCEPT="Accept: application/vnd.github+json"
+TOKEN_FILE="/etc/versanode/github.token"
+if [ -r "$TOKEN_FILE" ]; then
+  TOKEN="$(tr -d '\\n' < "$TOKEN_FILE")"
+  curl -fsSL -H "$HDR_ACCEPT" -H "Authorization: Bearer $TOKEN" "$URL"
+else
+  # unauthenticated will likely fail (401); suppress error and print empty array
+  curl -fsS -H "$HDR_ACCEPT" "$URL" 2>/dev/null || echo '[]'
+fi
+`;
+  const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "try", err: "message" });
+  let pkgs;
+  try {
+    pkgs = JSON.parse(out);
+  } catch (e) {
+    throw new Error("Unexpected response from GitHub API");
+  }
+  // Map to DataList items expected by this UI
+  return (pkgs || []).map(p => ({
     name: `ghcr.io/versanode/${p.name}`,
     description: p.description || "GitHub Container Registry (versanode)",
   }));
@@ -65,8 +73,8 @@ export const ImageSearchModal = ({ downloadImage }) => {
   const [searchFinished, setSearchFinished] = useState(false);
   const [imageIdentifier, setImageIdentifier] = useState('');
   const [imageList, setImageList] = useState([]);
-  const [imageTag, setImageTag] = useState("");
-  const [selectedRegistry, setSelectedRegistry] = useState("ghcr.io");
+  const [imageTag, setImageTag] = useState("latest");
+  const [selectedRegistry, setSelectedRegistry] = useState("ghcr.io"); // default to ghcr
   const [selected, setSelected] = useState("");
   const [dialogError, setDialogError] = useState("");
   const [dialogErrorDetail, setDialogErrorDetail] = useState("");
@@ -77,9 +85,11 @@ export const ImageSearchModal = ({ downloadImage }) => {
   const { registries } = useDockerInfo();
   const Dialogs = useDialogs();
 
-  // Registries to use for searching (ensure fallbackRegistries in util.js includes ["docker.io","ghcr.io"])
+  // Registries to use for searching
   const searchRegistries =
-    registries?.search && registries.search.length !== 0 ? registries.search : fallbackRegistries;
+    (registries?.search && registries.search.length !== 0)
+      ? registries.search
+      : fallbackRegistries;
 
   const closeActiveConnection = () => {
     if (activeConnectionRef.current) {
@@ -88,34 +98,29 @@ export const ImageSearchModal = ({ downloadImage }) => {
     }
   };
 
-  // Don't use selectedRegistry state inside due to async updates; pass it in as arg.
+  // Don't use selectedRegistry state inside due to async; pass as arg.
   const onSearchTriggered = async (searchRegistry = "", forceSearch = false) => {
     setSearchFinished(false);
 
-    // Short-circuit length unless Enter is pressed
-    if (imageIdentifier.length < 2 && !forceSearch)
-      return;
-
     const targetGhcr = isGhcr(searchRegistry) || isGhcrVersanodeTerm(imageIdentifier);
-
-    // If GHCR is targeted and no specific repo typed yet, list org packages via GitHub API (DEV ONLY)
     const typedRepo = imageIdentifier
       .replace(/^ghcr\.io\/?versanode\/?/i, "")
       .replace(/^versanode\/?/i, "")
       .trim();
 
+    // If GHCR targeted and no specific repo typed yet, list org packages via GitHub API (server-side)
     if (targetGhcr && typedRepo.length === 0) {
       setDialogError(""); setDialogErrorDetail("");
       setSearchInProgress(true);
       try {
-        const pkgs = await fetchGhcrOrgPackagesDev();
+        const pkgs = await fetchGhcrOrgPackagesViaSpawn();
         setImageList(pkgs);
         setSelected(pkgs.length ? "0" : "");
       } catch (e) {
         setImageList([]);
         setSelected("");
         setDialogError(_("Failed to list GHCR packages"));
-        setDialogErrorDetail(e?.message || String(e));
+        setDialogErrorDetail(e.message || String(e));
       } finally {
         setSearchInProgress(false);
         setSearchFinished(true);
@@ -124,8 +129,8 @@ export const ImageSearchModal = ({ downloadImage }) => {
       return;
     }
 
+    // If user typed a specific versanode repo, synthesize the full name (no /images/search on GHCR)
     if (targetGhcr) {
-      // No /images/search on GHCR; synthesize a single result under versanode
       const fullName = buildGhcrVersanodeName(imageIdentifier);
       const bareNamespace = GHCR_NAMESPACE.replace(/\/+$/, "");
       if (!fullName || fullName === bareNamespace) {
@@ -141,8 +146,12 @@ export const ImageSearchModal = ({ downloadImage }) => {
       return;
     }
 
-    // Docker Hub (or other registries that support the search API)
+    // Short-circuit length unless Enter is pressed (Docker Hub search only)
+    if (imageIdentifier.length < 2 && !forceSearch) return;
+
+    // Docker Hub (or registries that support /images/search)
     setSearchInProgress(true);
+    setDialogError(""); setDialogErrorDetail("");
 
     // Close any previous connection, then open a fresh one
     closeActiveConnection();
@@ -170,41 +179,36 @@ export const ImageSearchModal = ({ downloadImage }) => {
       });
     });
 
-    Promise.allSettled(searches)
-      .then(reply => {
-        if (reply) {
-          let results = [];
-
-          for (const result of reply) {
-            if (result.status === "fulfilled") {
-              results = results.concat(JSON.parse(result.value));
-            } else {
-              setDialogError(_("Failed to search for new images"));
-              setDialogErrorDetail(result.reason
-                ? cockpit.format(_("Failed to search for images: $0"), result.reason.message)
-                : _("Failed to search for images."));
-            }
+    try {
+      const reply = await Promise.allSettled(searches);
+      if (reply) {
+        let results = [];
+        for (const result of reply) {
+          if (result.status === "fulfilled") {
+            results = results.concat(JSON.parse(result.value));
+          } else {
+            setDialogError(_("Failed to search for new images"));
+            setDialogErrorDetail(result.reason
+              ? cockpit.format(_("Failed to search for images: $0"), result.reason.message)
+              : _("Failed to search for images."));
           }
-
-          setImageList(results || []);
-          setSearchInProgress(false);
-          setSearchFinished(true);
         }
-      })
-      .catch(err => {
-        setDialogError(_("Failed to search for new images"));
-        setDialogErrorDetail(err?.message || String(err));
+        setImageList(results || []);
         setSearchInProgress(false);
         setSearchFinished(true);
-      });
+      }
+    } catch (err) {
+      setDialogError(_("Failed to search for new images"));
+      setDialogErrorDetail(err?.message || String(err));
+      setSearchInProgress(false);
+      setSearchFinished(true);
+    }
   };
 
   const onKeyDown = (e) => {
     if (e.key !== ' ') { // Space should not trigger search
       const forceSearch = e.key === 'Enter';
       if (forceSearch) e.preventDefault();
-
-      // Reset the timer, to make the http call after 250ms
       clearTimeout(typingTimeout);
       setTypingTimeout(setTimeout(() => onSearchTriggered(selectedRegistry, forceSearch), 250));
     }
@@ -215,7 +219,6 @@ export const ImageSearchModal = ({ downloadImage }) => {
     const selectedImageName = imageList[selected].name;
     closeActiveConnection();
     Dialogs.close();
-    // default tag to "latest" if empty/whitespace
     const tag = (imageTag || "").trim() || "latest";
     downloadImage(selectedImageName, tag);
   };
@@ -291,7 +294,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
         </Flex>
       </Form>
 
-      {searchInProgress && <EmptyStatePanel loading title={_("Searching...")} />}
+      {searchInProgress && <EmptyStatePanel loading title={_("Searching...")} /> }
 
       {((!searchInProgress && !searchFinished) || imageIdentifier === "") && (
         <EmptyStatePanel title={_("No images found")} paragraph={_("Start typing to look for images.")} />
