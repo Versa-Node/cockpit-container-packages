@@ -32,8 +32,21 @@ export const ImageSearchModal = ({ downloadImage }) => {
     const [dialogError, setDialogError] = useState("");
     const [dialogErrorDetail, setDialogErrorDetail] = useState("");
     const [typingTimeout, setTypingTimeout] = useState(null);
-    const isGhcr = (reg) => (reg || "").trim().toLowerCase() === "ghcr.io";
-    const isFullyQualifiedGhcr = (term) => /^ghcr\.io\/[^/]+\/[^/]+/i.test(term || "");
+    const GHCR_NAMESPACE = "ghcr.io/versanode/";
+
+const isGhcr = (reg) => (reg || "").trim().toLowerCase() === "ghcr.io";
+
+// user typed a GHCR versanode reference? (either fully-qualified or org-prefixed)
+const isGhcrVersanodeTerm = (term) =>
+  /^ghcr\.io\/versanode\/[^/]+/i.test(term || "") || /^versanode\/[^/]+/i.test(term || "");
+
+// turn free text into the final ghcr.io/versanode/<name>
+const buildGhcrVersanodeName = (txt) => {
+  const t = (txt || "").trim()
+    .replace(/^ghcr\.io\/?/i, "")
+    .replace(/^versanode\/?/i, "");
+  return (GHCR_NAMESPACE + t).replace(/\/+$/, "");
+};
 
     let activeConnection = null;
     const { registries } = useDockerInfo();
