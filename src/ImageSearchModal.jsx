@@ -32,6 +32,8 @@ export const ImageSearchModal = ({ downloadImage }) => {
     const [dialogError, setDialogError] = useState("");
     const [dialogErrorDetail, setDialogErrorDetail] = useState("");
     const [typingTimeout, setTypingTimeout] = useState(null);
+    const isGhcr = (reg) => (reg || "").trim().toLowerCase() === "ghcr.io";
+    const isFullyQualifiedGhcr = (term) => /^ghcr\.io\/[^/]+\/[^/]+/i.test(term || "");
 
     let activeConnection = null;
     const { registries } = useDockerInfo();
@@ -55,6 +57,20 @@ export const ImageSearchModal = ({ downloadImage }) => {
         // The comparison was done considering the fact that we miss always one letter due to delayed setState
         if (imageIdentifier.length < 2 && !forceSearch)
             return;
+
+     // --- GHCR handling: no /images/search available ---
+      // If user chose ghcr.io OR typed a fully-qualified ghcr.io name,
+   // just show the typed value as a single result and skip the Docker search call.
+   if (isGhcr(searchRegistry) || isFullyQualifiedGhcr(imageIdentifier)) {
+       const name = isFullyQualifiedGhcr(imageIdentifier)
+           ? imageIdentifier.trim()
+           : `ghcr.io/${imageIdentifier.trim()}`.replace(/\/+/g, "/");
+       setImageList([{ name, description: _("GitHub Container Registry") }]);
+       setSelected("0");
+       setSearchInProgress(false);
+       setSearchFinished(true);
+       return;
+   }
 
         setSearchInProgress(true);
 
