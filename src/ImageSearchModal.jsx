@@ -20,7 +20,7 @@ import './ImageSearchModal.css';
 
 const _ = cockpit.gettext;
 
-// ---- GHCR helpers ----
+// ---------- GHCR helpers ----------
 const GHCR_NAMESPACE = "ghcr.io/versanode/";
 
 const isGhcr = (reg) => (reg || "").trim().toLowerCase() === "ghcr.io";
@@ -37,6 +37,29 @@ const buildGhcrVersanodeName = (txt) => {
   return (GHCR_NAMESPACE + t).replace(/\/+$/, "");
 };
 
+// ---------- DEV ONLY: hard-coded PAT listing for GHCR org ----------
+// Do NOT ship this. Move to a server-side proxy or cockpit.spawn with a root-owned file.
+const GH_ORG = "Versa-Node";
+const GH_TOKEN = "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";
+async function fetchGhcrOrgPackagesDev() {
+  const resp = await fetch(
+    `https://api.github.com/orgs/${GH_ORG}/packages?package_type=container&per_page=100`,
+    {
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${GH_TOKEN}`,
+      },
+    }
+  );
+  if (!resp.ok) throw new Error(`GitHub API ${resp.status}: ${await resp.text()}`);
+  const packages = await resp.json();
+  // Map to your DataList item shape (lowercase keys)
+  return (packages || []).map(p => ({
+    name: `ghcr.io/versanode/${p.name}`,
+    description: p.description || "GitHub Container Registry (versanode)",
+  }));
+}
+
 export const ImageSearchModal = ({ downloadImage }) => {
   const [searchInProgress, setSearchInProgress] = useState(false);
   const [searchFinished, setSearchFinished] = useState(false);
@@ -49,13 +72,12 @@ export const ImageSearchModal = ({ downloadImage }) => {
   const [dialogErrorDetail, setDialogErrorDetail] = useState("");
   const [typingTimeout, setTypingTimeout] = useState(null);
 
-  // keep the active REST connection across renders
   const activeConnectionRef = useRef(null);
 
   const { registries } = useDockerInfo();
   const Dialogs = useDialogs();
 
-  // Registries to use for searching
+  // Registries to use for searching (ensure fallbackRegistries in util.js includes ["docker.io","ghcr.io"])
   const searchRegistries =
     registries?.search && registries.search.length !== 0 ? registries.search : fallbackRegistries;
 
@@ -67,15 +89,40 @@ export const ImageSearchModal = ({ downloadImage }) => {
   };
 
   // Don't use selectedRegistry state inside due to async updates; pass it in as arg.
-  const onSearchTriggered = (searchRegistry = "", forceSearch = false) => {
+  const onSearchTriggered = async (searchRegistry = "", forceSearch = false) => {
     setSearchFinished(false);
 
     // Short-circuit length unless Enter is pressed
     if (imageIdentifier.length < 2 && !forceSearch)
       return;
 
-    // Decide if this search targets GHCR (versanode) or Docker Hub
     const targetGhcr = isGhcr(searchRegistry) || isGhcrVersanodeTerm(imageIdentifier);
+
+    // If GHCR is targeted and no specific repo typed yet, list org packages via GitHub API (DEV ONLY)
+    const typedRepo = imageIdentifier
+      .replace(/^ghcr\.io\/?versanode\/?/i, "")
+      .replace(/^versanode\/?/i, "")
+      .trim();
+
+    if (targetGhcr && typedRepo.length === 0) {
+      setDialogError(""); setDialogErrorDetail("");
+      setSearchInProgress(true);
+      try {
+        const pkgs = await fetchGhcrOrgPackagesDev();
+        setImageList(pkgs);
+        setSelected(pkgs.length ? "0" : "");
+      } catch (e) {
+        setImageList([]);
+        setSelected("");
+        setDialogError(_("Failed to list GHCR packages"));
+        setDialogErrorDetail(e?.message || String(e));
+      } finally {
+        setSearchInProgress(false);
+        setSearchFinished(true);
+      }
+      closeActiveConnection();
+      return;
+    }
 
     if (targetGhcr) {
       // No /images/search on GHCR; synthesize a single result under versanode
@@ -90,7 +137,6 @@ export const ImageSearchModal = ({ downloadImage }) => {
       }
       setSearchInProgress(false);
       setSearchFinished(true);
-      // Ensure any previous connection is closed
       closeActiveConnection();
       return;
     }
