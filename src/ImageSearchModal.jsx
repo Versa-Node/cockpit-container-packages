@@ -1,11 +1,10 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import { Button } from "@patternfly/react-core/dist/esm/components/Button";
 import { DataList, DataListCell, DataListItem, DataListItemCells, DataListItemRow } from "@patternfly/react-core/dist/esm/components/DataList";
 import { Flex } from "@patternfly/react-core/dist/esm/layouts/Flex";
 import { Form, FormGroup } from "@patternfly/react-core/dist/esm/components/Form";
 import { FormSelect, FormSelectOption } from "@patternfly/react-core/dist/esm/components/FormSelect";
 import { Modal } from "@patternfly/react-core/dist/esm/components/Modal";
-import { Radio } from "@patternfly/react-core/dist/esm/components/Radio";
 import { TextInput } from "@patternfly/react-core/dist/esm/components/TextInput";
 import { ExclamationCircleIcon } from '@patternfly/react-icons';
 
@@ -21,18 +20,8 @@ import './ImageSearchModal.css';
 
 const _ = cockpit.gettext;
 
-export const ImageSearchModal = ({ downloadImage }) => {
-    const [searchInProgress, setSearchInProgress] = useState(false);
-    const [searchFinished, setSearchFinished] = useState(false);
-    const [imageIdentifier, setImageIdentifier] = useState('');
-    const [imageList, setImageList] = useState([]);
-    const [imageTag, setImageTag] = useState("");
-    const [selectedRegistry, setSelectedRegistry] = useState("");
-    const [selected, setSelected] = useState("");
-    const [dialogError, setDialogError] = useState("");
-    const [dialogErrorDetail, setDialogErrorDetail] = useState("");
-    const [typingTimeout, setTypingTimeout] = useState(null);
-    const GHCR_NAMESPACE = "ghcr.io/versanode/";
+// ---- GHCR helpers ----
+const GHCR_NAMESPACE = "ghcr.io/versanode/";
 
 const isGhcr = (reg) => (reg || "").trim().toLowerCase() === "ghcr.io";
 
@@ -48,194 +37,255 @@ const buildGhcrVersanodeName = (txt) => {
   return (GHCR_NAMESPACE + t).replace(/\/+$/, "");
 };
 
-    let activeConnection = null;
-    const { registries } = useDockerInfo();
-    const Dialogs = useDialogs();
-    // Registries to use for searching
-    const searchRegistries = registries.search && registries.length !== 0 ? registries.search : fallbackRegistries;
+export const ImageSearchModal = ({ downloadImage }) => {
+  const [searchInProgress, setSearchInProgress] = useState(false);
+  const [searchFinished, setSearchFinished] = useState(false);
+  const [imageIdentifier, setImageIdentifier] = useState('');
+  const [imageList, setImageList] = useState([]);
+  const [imageTag, setImageTag] = useState("");
+  const [selectedRegistry, setSelectedRegistry] = useState("ghcr.io");
+  const [selected, setSelected] = useState("");
+  const [dialogError, setDialogError] = useState("");
+  const [dialogErrorDetail, setDialogErrorDetail] = useState("");
+  const [typingTimeout, setTypingTimeout] = useState(null);
 
-    // Don't use on selectedRegistry state variable for finding out the
-    // registry to search in as with useState we can only call something after a
-    // state update with useEffect but as onSearchTriggered also changes state we
-    // can't use that so instead we pass the selected registry.
-    const onSearchTriggered = (searchRegistry = "", forceSearch = false) => {
-        // When search re-triggers close any existing active connection
-        activeConnection = rest.connect(client.getAddress());
-        if (activeConnection)
-            activeConnection.close();
-        setSearchFinished(false);
+  // keep the active REST connection across renders
+  const activeConnectionRef = useRef(null);
 
-        // Do not call the SearchImage API if the input string  is not at least 2 chars,
-        // unless Enter is pressed, which should force start the search.
-        // The comparison was done considering the fact that we miss always one letter due to delayed setState
-        if (imageIdentifier.length < 2 && !forceSearch)
-            return;
+  const { registries } = useDockerInfo();
+  const Dialogs = useDialogs();
 
-     // --- GHCR handling: no /images/search available ---
-      // If user chose ghcr.io OR typed a fully-qualified ghcr.io name,
-   // just show the typed value as a single result and skip the Docker search call.
-   if (isGhcr(searchRegistry) || isFullyQualifiedGhcr(imageIdentifier)) {
-       const name = isFullyQualifiedGhcr(imageIdentifier)
-           ? imageIdentifier.trim()
-           : `ghcr.io/${imageIdentifier.trim()}`.replace(/\/+/g, "/");
-       setImageList([{ name, description: _("GitHub Container Registry") }]);
-       setSelected("0");
-       setSearchInProgress(false);
-       setSearchFinished(true);
-       return;
-   }
+  // Registries to use for searching
+  const searchRegistries =
+    registries?.search && registries.search.length !== 0 ? registries.search : fallbackRegistries;
 
-        setSearchInProgress(true);
+  const closeActiveConnection = () => {
+    if (activeConnectionRef.current) {
+      try { activeConnectionRef.current.close(); } catch (e) {}
+      activeConnectionRef.current = null;
+    }
+  };
 
-        let queryRegistries = searchRegistries;
-        if (searchRegistry !== "") {
-            queryRegistries = [searchRegistry];
+  // Don't use selectedRegistry state inside due to async updates; pass it in as arg.
+  const onSearchTriggered = (searchRegistry = "", forceSearch = false) => {
+    setSearchFinished(false);
+
+    // Short-circuit length unless Enter is pressed
+    if (imageIdentifier.length < 2 && !forceSearch)
+      return;
+
+    // Decide if this search targets GHCR (versanode) or Docker Hub
+    const targetGhcr = isGhcr(searchRegistry) || isGhcrVersanodeTerm(imageIdentifier);
+
+    if (targetGhcr) {
+      // No /images/search on GHCR; synthesize a single result under versanode
+      const fullName = buildGhcrVersanodeName(imageIdentifier);
+      const bareNamespace = GHCR_NAMESPACE.replace(/\/+$/, "");
+      if (!fullName || fullName === bareNamespace) {
+        setImageList([]);
+        setSelected("");
+      } else {
+        setImageList([{ name: fullName, description: _("GitHub Container Registry (versanode)") }]);
+        setSelected("0");
+      }
+      setSearchInProgress(false);
+      setSearchFinished(true);
+      // Ensure any previous connection is closed
+      closeActiveConnection();
+      return;
+    }
+
+    // Docker Hub (or other registries that support the search API)
+    setSearchInProgress(true);
+
+    // Close any previous connection, then open a fresh one
+    closeActiveConnection();
+    activeConnectionRef.current = rest.connect(client.getAddress());
+
+    let queryRegistries = searchRegistries;
+    if (searchRegistry !== "") {
+      queryRegistries = [searchRegistry];
+    }
+
+    // if a user searches for `docker.io/cockpit` let docker search in the user specified registry.
+    if (imageIdentifier.includes('/')) {
+      queryRegistries = [""];
+    }
+
+    const searches = queryRegistries.map(rr => {
+      const registry = rr.length < 1 || rr[rr.length - 1] === "/" ? rr : rr + "/";
+      return activeConnectionRef.current.call({
+        method: "GET",
+        path: client.VERSION + "/images/search",
+        body: "",
+        params: {
+          term: registry + imageIdentifier
         }
-        // if a user searches for `docker.io/cockpit` let docker search in the user specified registry.
-        if (imageIdentifier.includes('/')) {
-            queryRegistries = [""];
-        }
+      });
+    });
 
-        const searches = queryRegistries.map(rr => {
-            const registry = rr.length < 1 || rr[rr.length - 1] === "/" ? rr : rr + "/";
-            return activeConnection.call({
-                method: "GET",
-                path: client.VERSION + "/images/search",
-                body: "",
-                params: {
-                    term: registry + imageIdentifier
-                }
-            });
-        });
+    Promise.allSettled(searches)
+      .then(reply => {
+        if (reply) {
+          let results = [];
 
-        Promise.allSettled(searches)
-                .then(reply => {
-                    if (reply) {
-                        let results = [];
-
-                        for (const result of reply) {
-                            if (result.status === "fulfilled") {
-                                results = results.concat(JSON.parse(result.value));
-                                // console.log(results);
-                            } else {
-                                setDialogError(_("Failed to search for new images"));
-                                setDialogErrorDetail(result.reason ? cockpit.format(_("Failed to search for images: $0"), result.reason.message) : _("Failed to search for images."));
-                            }
-                        }
-
-                        setImageList(results || []);
-                        setSearchInProgress(false);
-                        setSearchFinished(true);
-                    }
-                });
-    };
-
-    const onKeyDown = (e) => {
-        if (e.key != ' ') { // Space should not trigger search
-            const forceSearch = e.key == 'Enter';
-            if (forceSearch) {
-                e.preventDefault();
+          for (const result of reply) {
+            if (result.status === "fulfilled") {
+              results = results.concat(JSON.parse(result.value));
+            } else {
+              setDialogError(_("Failed to search for new images"));
+              setDialogErrorDetail(result.reason
+                ? cockpit.format(_("Failed to search for images: $0"), result.reason.message)
+                : _("Failed to search for images."));
             }
+          }
 
-            // Reset the timer, to make the http call after 250MS
-            clearTimeout(typingTimeout);
-            setTypingTimeout(setTimeout(() => onSearchTriggered(selectedRegistry, forceSearch), 250));
+          setImageList(results || []);
+          setSearchInProgress(false);
+          setSearchFinished(true);
         }
-    };
+      })
+      .catch(err => {
+        setDialogError(_("Failed to search for new images"));
+        setDialogErrorDetail(err?.message || String(err));
+        setSearchInProgress(false);
+        setSearchFinished(true);
+      });
+  };
 
-    const onDownloadClicked = () => {
-        const selectedImageName = imageList[selected].name;
-        if (activeConnection)
-            activeConnection.close();
-        Dialogs.close();
-        downloadImage(selectedImageName, imageTag);
-    };
+  const onKeyDown = (e) => {
+    if (e.key !== ' ') { // Space should not trigger search
+      const forceSearch = e.key === 'Enter';
+      if (forceSearch) e.preventDefault();
 
-    const handleClose = () => {
-        if (activeConnection)
-            activeConnection.close();
-        Dialogs.close();
-    };
+      // Reset the timer, to make the http call after 250ms
+      clearTimeout(typingTimeout);
+      setTypingTimeout(setTimeout(() => onSearchTriggered(selectedRegistry, forceSearch), 250));
+    }
+  };
 
-    return (
-        <Modal isOpen className="docker-search"
-               position="top" variant="large"
-               onClose={handleClose}
-               title={_("Search for an image")}
-               footer={<>
-                   <Form isHorizontal className="image-search-tag-form">
-                       <FormGroup fieldId="image-search-tag" label={_("Tag")}>
-                           <TextInput className="image-tag-entry"
-                                  id="image-search-tag"
-                                  type='text'
-                                  placeholder="latest"
-                                  value={imageTag || 'latest'}
-                                  onChange={(_event, value) => setImageTag(value)} />
-                       </FormGroup>
-                   </Form>
-                   <Button variant='primary' isDisabled={selected === ""} onClick={onDownloadClicked}>
-                       {_("Download")}
-                   </Button>
-                   <Button variant='link' className='btn-cancel' onClick={handleClose}>
-                       {_("Cancel")}
-                   </Button>
-               </>}
-        >
-            <Form isHorizontal>
-                {dialogError && <ErrorNotification errorMessage={dialogError} errorDetail={dialogErrorDetail} />}
-                <Flex spaceItems={{ default: 'inlineFlex', modifier: 'spaceItemsXl' }}>
-                    <FormGroup fieldId="search-image-dialog-name" label={_("Search for")}>
-                        <TextInput id='search-image-dialog-name'
-                                   type='text'
-                                   placeholder={_("Search by name or description")}
-                                   value={imageIdentifier}
-                                   onKeyDown={onKeyDown}
-                                   onChange={(_event, value) => setImageIdentifier(value)} />
-                    </FormGroup>
-                    <FormGroup fieldId="registry-select" label={_("in")}>
-                        <FormSelect id='registry-select'
-                            value={selectedRegistry}
-                            onChange={(_ev, value) => { setSelectedRegistry(value); clearTimeout(typingTimeout); onSearchTriggered(value, false) }}>
-                            <FormSelectOption value="" key="all" label={_("All registries")} />
-                            {(searchRegistries || []).map(r => <FormSelectOption value={r} key={r} label={r} />)}
-                        </FormSelect>
-                    </FormGroup>
-                </Flex>
-            </Form>
+  const onDownloadClicked = () => {
+    if (!imageList.length || selected === "") return;
+    const selectedImageName = imageList[selected].name;
+    closeActiveConnection();
+    Dialogs.close();
+    // default tag to "latest" if empty/whitespace
+    const tag = (imageTag || "").trim() || "latest";
+    downloadImage(selectedImageName, tag);
+  };
 
-            {searchInProgress && <EmptyStatePanel loading title={_("Searching...")} /> }
+  const handleClose = () => {
+    closeActiveConnection();
+    Dialogs.close();
+  };
 
-            {((!searchInProgress && !searchFinished) || imageIdentifier == "") && <EmptyStatePanel title={_("No images found")} paragraph={_("Start typing to look for images.")} /> }
+  return (
+    <Modal
+      isOpen
+      className="docker-search"
+      position="top"
+      variant="large"
+      onClose={handleClose}
+      title={_("Search for an image")}
+      footer={
+        <>
+          <Form isHorizontal className="image-search-tag-form">
+            <FormGroup fieldId="image-search-tag" label={_("Tag")}>
+              <TextInput
+                className="image-tag-entry"
+                id="image-search-tag"
+                type="text"
+                placeholder="latest"
+                value={imageTag}
+                onChange={(_event, value) => setImageTag(value)}
+              />
+            </FormGroup>
+          </Form>
+          <Button variant="primary" isDisabled={selected === ""} onClick={onDownloadClicked}>
+            {_("Download")}
+          </Button>
+          <Button variant="link" className="btn-cancel" onClick={handleClose}>
+            {_("Cancel")}
+          </Button>
+        </>
+      }
+    >
+      <Form isHorizontal>
+        {dialogError && <ErrorNotification errorMessage={dialogError} errorDetail={dialogErrorDetail} />}
+        <Flex spaceItems={{ default: 'inlineFlex', modifier: 'spaceItemsXl' }}>
+          <FormGroup fieldId="search-image-dialog-name" label={_("Search for")}>
+            <TextInput
+              id="search-image-dialog-name"
+              type="text"
+              placeholder={_("Type image (e.g. nginx) or versanode/<repo>")}
+              value={imageIdentifier}
+              onKeyDown={onKeyDown}
+              onChange={(_event, value) => setImageIdentifier(value)}
+            />
+          </FormGroup>
+          <FormGroup fieldId="registry-select" label={_("in")}>
+            <FormSelect
+              id="registry-select"
+              value={selectedRegistry}
+              onChange={(_ev, value) => {
+                setSelectedRegistry(value);
+                clearTimeout(typingTimeout);
+                onSearchTriggered(value, false);
+              }}
+            >
+              {(searchRegistries || []).map(r => (
+                <FormSelectOption
+                  value={r}
+                  key={r}
+                  label={r === "ghcr.io" ? "ghcr.io (versanode)" : r}
+                />
+              ))}
+            </FormSelect>
+          </FormGroup>
+        </Flex>
+      </Form>
 
-            {searchFinished && imageIdentifier !== '' && <>
-                {imageList.length == 0 && <EmptyStatePanel icon={ExclamationCircleIcon}
-                                                                      title={cockpit.format(_("No results for $0"), imageIdentifier)}
-                                                                      paragraph={_("Retry another term.")}
-                />}
-                {imageList.length > 0 &&
-                <DataList isCompact
-                          selectedDataListItemId={"image-list-item-" + selected}
-                          onSelectDataListItem={(_, key) => setSelected(key.split('-').slice(-1)[0])}>
-                    {imageList.map((image, iter) => {
-                        return (
-                            <DataListItem id={"image-list-item-" + iter} key={iter}>
-                                <DataListItemRow>
-                                    <DataListItemCells
-                                              dataListCells={[
-                                                  <DataListCell key="primary content">
-                                                      <span className='image-name'>{image.name}</span>
-                                                  </DataListCell>,
-                                                  <DataListCell key="secondary content" wrapModifier="truncate">
-                                                      <span className='image-description'>{image.description}</span>
-                                                  </DataListCell>
-                                              ]}
-                                    />
-                                </DataListItemRow>
-                            </DataListItem>
-                        );
-                    })}
-                </DataList>}
-            </>}
-        </Modal>
-    );
+      {searchInProgress && <EmptyStatePanel loading title={_("Searching...")} />}
+
+      {((!searchInProgress && !searchFinished) || imageIdentifier === "") && (
+        <EmptyStatePanel title={_("No images found")} paragraph={_("Start typing to look for images.")} />
+      )}
+
+      {searchFinished && imageIdentifier !== '' && (
+        <>
+          {imageList.length === 0 && (
+            <EmptyStatePanel
+              icon={ExclamationCircleIcon}
+              title={cockpit.format(_("No results for $0"), imageIdentifier)}
+              paragraph={_("Retry another term.")}
+            />
+          )}
+          {imageList.length > 0 && (
+            <DataList
+              isCompact
+              selectedDataListItemId={"image-list-item-" + selected}
+              onSelectDataListItem={(_, key) => setSelected(key.split('-').slice(-1)[0])}
+            >
+              {imageList.map((image, iter) => (
+                <DataListItem id={"image-list-item-" + iter} key={iter}>
+                  <DataListItemRow>
+                    <DataListItemCells
+                      dataListCells={[
+                        <DataListCell key="primary content">
+                          <span className="image-name">{image.name}</span>
+                        </DataListCell>,
+                        <DataListCell key="secondary content" wrapModifier="truncate">
+                          <span className="image-description">{image.description}</span>
+                        </DataListCell>
+                      ]}
+                    />
+                  </DataListItemRow>
+                </DataListItem>
+              ))}
+            </DataList>
+          )}
+        </>
+      )}
+    </Modal>
+  );
 };
