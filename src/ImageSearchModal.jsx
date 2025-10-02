@@ -39,27 +39,37 @@ const buildGhcrVersanodeName = (txt) => {
 };
 
 // server-side (host) fetch via cockpit.spawn (avoids CSP)
-// reads PAT from /etc/versanode/github.token if present (0600)
+// reads PAT from /etc/versanode/github.token (0600, root:root)
 async function fetchGhcrOrgPackagesViaSpawn() {
   const script = `
-set -eo pipefail
+set -euo pipefail
 URL="https://api.github.com/orgs/${GH_ORG}/packages?package_type=container&per_page=100"
 HDR_ACCEPT="Accept: application/vnd.github+json"
+HDR_API="X-GitHub-Api-Version: 2022-11-28"
+HDR_UA="User-Agent: versanode-cockpit/1.0"
 TOKEN_FILE="/etc/versanode/github.token"
-if [ -r "$TOKEN_FILE" ]; then
-  TOKEN="$(tr -d '\\n' < "$TOKEN_FILE")"
-  curl -fsSL -H "$HDR_ACCEPT" -H "Authorization: Bearer $TOKEN" "$URL"
-else
-  # unauthenticated will likely fail (401); suppress error and print empty array
-  curl -fsS -H "$HDR_ACCEPT" "$URL" 2>/dev/null || echo '[]'
+
+if [ ! -r "$TOKEN_FILE" ]; then
+  echo "PAT file not found or unreadable at $TOKEN_FILE" >&2
+  exit 40
 fi
+
+# Strip CR/LF just in case
+TOKEN="$(tr -d '\\r\\n' < "$TOKEN_FILE")"
+if [ -z "$TOKEN" ]; then
+  echo "PAT file is empty" >&2
+  exit 41
+fi
+
+# Use Bearer (works for fine-grained or classic PAT)
+curl -fsSL -H "$HDR_ACCEPT" -H "$HDR_API" -H "$HDR_UA" -H "Authorization: Bearer $TOKEN" "$URL"
 `;
-  const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "try", err: "message" });
+  const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
   let pkgs;
   try {
     pkgs = JSON.parse(out);
-  } catch (e) {
-    throw new Error("Unexpected response from GitHub API");
+  } catch (_e) {
+    throw new Error("Unexpected response from GitHub API (not JSON)");
   }
   // Map to DataList items expected by this UI
   return (pkgs || []).map(p => ({
@@ -79,21 +89,24 @@ export const ImageSearchModal = ({ downloadImage }) => {
   const [dialogError, setDialogError] = useState("");
   const [dialogErrorDetail, setDialogErrorDetail] = useState("");
   const [typingTimeout, setTypingTimeout] = useState(null);
+  const [ghcrOrgListing, setGhcrOrgListing] = useState(false); // show results even with empty input
 
   const activeConnectionRef = useRef(null);
 
   const { registries } = useDockerInfo();
   const Dialogs = useDialogs();
 
-  // Registries to use for searching
-  const searchRegistries =
+  // Registries to use for searching; make sure ghcr.io is present
+  const baseRegistries =
     (registries?.search && registries.search.length !== 0)
       ? registries.search
       : fallbackRegistries;
 
+  const mergedRegistries = Array.from(new Set(["ghcr.io", ...(baseRegistries || [])]));
+
   const closeActiveConnection = () => {
     if (activeConnectionRef.current) {
-      try { activeConnectionRef.current.close(); } catch (e) {}
+      try { activeConnectionRef.current.close(); } catch (_e) {}
       activeConnectionRef.current = null;
     }
   };
@@ -112,6 +125,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
     if (targetGhcr && typedRepo.length === 0) {
       setDialogError(""); setDialogErrorDetail("");
       setSearchInProgress(true);
+      setGhcrOrgListing(true);
       try {
         const pkgs = await fetchGhcrOrgPackagesViaSpawn();
         setImageList(pkgs);
@@ -140,24 +154,29 @@ export const ImageSearchModal = ({ downloadImage }) => {
         setImageList([{ name: fullName, description: _("GitHub Container Registry (versanode)") }]);
         setSelected("0");
       }
+      setGhcrOrgListing(false);
       setSearchInProgress(false);
       setSearchFinished(true);
       closeActiveConnection();
       return;
     }
 
-    // Short-circuit length unless Enter is pressed (Docker Hub search only)
-    if (imageIdentifier.length < 2 && !forceSearch) return;
-
     // Docker Hub (or registries that support /images/search)
+    // Short-circuit length unless Enter is pressed
+    if (imageIdentifier.length < 2 && !forceSearch) {
+      setGhcrOrgListing(false);
+      return;
+    }
+
     setSearchInProgress(true);
     setDialogError(""); setDialogErrorDetail("");
+    setGhcrOrgListing(false);
 
     // Close any previous connection, then open a fresh one
     closeActiveConnection();
     activeConnectionRef.current = rest.connect(client.getAddress());
 
-    let queryRegistries = searchRegistries;
+    let queryRegistries = baseRegistries;
     if (searchRegistry !== "") {
       queryRegistries = [searchRegistry];
     }
@@ -167,7 +186,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
       queryRegistries = [""];
     }
 
-    const searches = queryRegistries.map(rr => {
+    const searches = (queryRegistries || []).map(rr => {
       const registry = rr.length < 1 || rr[rr.length - 1] === "/" ? rr : rr + "/";
       return activeConnectionRef.current.call({
         method: "GET",
@@ -194,12 +213,11 @@ export const ImageSearchModal = ({ downloadImage }) => {
           }
         }
         setImageList(results || []);
-        setSearchInProgress(false);
-        setSearchFinished(true);
       }
     } catch (err) {
       setDialogError(_("Failed to search for new images"));
       setDialogErrorDetail(err?.message || String(err));
+    } finally {
       setSearchInProgress(false);
       setSearchFinished(true);
     }
@@ -282,7 +300,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
                 onSearchTriggered(value, false);
               }}
             >
-              {(searchRegistries || []).map(r => (
+              {(mergedRegistries || []).map(r => (
                 <FormSelectOption
                   value={r}
                   key={r}
@@ -296,17 +314,19 @@ export const ImageSearchModal = ({ downloadImage }) => {
 
       {searchInProgress && <EmptyStatePanel loading title={_("Searching...")} /> }
 
-      {((!searchInProgress && !searchFinished) || imageIdentifier === "") && (
-        <EmptyStatePanel title={_("No images found")} paragraph={_("Start typing to look for images.")} />
+      {/* Initial state / instructions */}
+      {!searchInProgress && !searchFinished && !ghcrOrgListing && imageIdentifier === "" && (
+        <EmptyStatePanel title={_("No images found")} paragraph={_("Start typing to look for images, or choose ghcr.io to list your org packages.")} />
       )}
 
-      {searchFinished && imageIdentifier !== '' && (
+      {/* Results */}
+      {searchFinished && (
         <>
           {imageList.length === 0 && (
             <EmptyStatePanel
               icon={ExclamationCircleIcon}
-              title={cockpit.format(_("No results for $0"), imageIdentifier)}
-              paragraph={_("Retry another term.")}
+              title={cockpit.format(_("No results for $0"), imageIdentifier || "GHCR")}
+              paragraph={_("Retry another term or switch registry.")}
             />
           )}
           {imageList.length > 0 && (
@@ -316,7 +336,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
               onSelectDataListItem={(_, key) => setSelected(key.split('-').slice(-1)[0])}
             >
               {imageList.map((image, iter) => (
-                <DataListItem id={"image-list-item-" + iter} key={iter}>
+                <DataListItem id={"image-list-item-" + iter} key={iter} className="image-list-item">
                   <DataListItemRow>
                     <DataListItemCells
                       dataListCells={[
