@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { Button } from "@patternfly/react-core/dist/esm/components/Button";
 import { DataList, DataListCell, DataListItem, DataListItemCells, DataListItemRow } from "@patternfly/react-core/dist/esm/components/DataList";
 import { Flex } from "@patternfly/react-core/dist/esm/layouts/Flex";
@@ -54,14 +54,12 @@ if [ ! -r "$TOKEN_FILE" ]; then
   exit 40
 fi
 
-# Strip CR/LF just in case
 TOKEN="$(tr -d '\\r\\n' < "$TOKEN_FILE")"
 if [ -z "$TOKEN" ]; then
   echo "PAT file is empty" >&2
   exit 41
 fi
 
-# Use Bearer (works for fine-grained or classic PAT)
 curl -fsSL -H "$HDR_ACCEPT" -H "$HDR_API" -H "$HDR_UA" -H "Authorization: Bearer $TOKEN" "$URL"
 `;
   const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
@@ -110,6 +108,31 @@ export const ImageSearchModal = ({ downloadImage }) => {
       activeConnectionRef.current = null;
     }
   };
+
+  // Trigger a fetch on first open if ghcr is selected and the box is empty
+  useEffect(() => {
+    if (selectedRegistry === "ghcr.io" && imageIdentifier.trim() === "") {
+      // fire and forget; no need to await here
+      onSearchTriggered("ghcr.io", true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // run once on mount
+
+  // If user switches to ghcr.io and the query is empty, list org packages
+  useEffect(() => {
+    if (selectedRegistry === "ghcr.io" && imageIdentifier.trim() === "") {
+      onSearchTriggered("ghcr.io", true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedRegistry]);
+
+  // Also, if the user clears the input while on ghcr, re-list the org
+  useEffect(() => {
+    if (selectedRegistry === "ghcr.io" && imageIdentifier.trim() === "") {
+      onSearchTriggered("ghcr.io", true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [imageIdentifier]);
 
   // Don't use selectedRegistry state inside due to async; pass as arg.
   const onSearchTriggered = async (searchRegistry = "", forceSearch = false) => {
@@ -315,8 +338,11 @@ export const ImageSearchModal = ({ downloadImage }) => {
       {searchInProgress && <EmptyStatePanel loading title={_("Searching...")} /> }
 
       {/* Initial state / instructions */}
-      {!searchInProgress && !searchFinished && !ghcrOrgListing && imageIdentifier === "" && (
-        <EmptyStatePanel title={_("No images found")} paragraph={_("Start typing to look for images, or choose ghcr.io to list your org packages.")} />
+      {!searchInProgress && !searchFinished && !ghcrOrgListing && imageIdentifier.trim() === "" && (
+        <EmptyStatePanel
+          title={_("No images found")}
+          paragraph={_("Start typing to look for images, or choose ghcr.io to list your org packages.")}
+        />
       )}
 
       {/* Results */}
