@@ -22,7 +22,7 @@ export const WithDockerInfo = ({ value, children }) => {
 // "Restarting" comes from special handling of restart case in Application.updateContainer()
 export const states = [_("Exited"), _("Paused"), _("Stopped"), _("Removing"), _("Configured"), _("Created"), _("Restart"), _("Running")];
 
-export const fallbackRegistries = ["docker.io", "quay.io"];
+export const fallbackRegistries = ["ghcr.io"];
 
 export function debug(...args) {
     if (window.debugging === "all" || window.debugging?.includes("docker"))
