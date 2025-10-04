@@ -20,33 +20,21 @@ import './ImageSearchModal.css';
 
 const _ = cockpit.gettext;
 
-/* ---------------- GHCR helpers (versa-node) ------------------ */
-// GitHub org (case-insensitive for API)
+// ---------- GHCR helpers ----------
 const GH_ORG = "Versa-Node";
-// Canonical GHCR namespace
 const GHCR_NAMESPACE = "ghcr.io/versa-node/";
-// Accept both the canonical 'versa-node' and legacy 'versanode' in user input
-const GHCR_ORG_ALIASES = ["versa-node", "versanode"];
 
 const isGhcr = (reg) => (reg || "").trim().toLowerCase() === "ghcr.io";
 
-// did the user type something that targets our GHCR org?
-const isGhcrVersaNodeTerm = (term) => {
-  const t = (term || "").trim().toLowerCase();
-  const aliasGroup = GHCR_ORG_ALIASES.join("|"); // "versa-node|versanode"
-  return new RegExp(`^ghcr\\.io\\/(${aliasGroup})\\/[^/]+`).test(t)
-      || new RegExp(`^(${aliasGroup})\\/[^/]+`).test(t);
-};
+// user typed a GHCR versa-node reference? (either fully-qualified or org-prefixed)
+const isGhcrVersaNodeTerm = (term) =>
+  /^ghcr\.io\/versa-node\/[^/]+/i.test(term || "") || /^versa-node\/[^/]+/i.test(term || "");
 
-// normalize free text to "ghcr.io/versa-node/<name>"
+// turn free text into the final ghcr.io/versa-node/<name>
 const buildGhcrVersaNodeName = (txt) => {
-  let t = (txt || "").trim();
-  // strip leading ghcr.io/
-  t = t.replace(/^ghcr\.io\/?/i, "");
-  // strip either alias org
-  const aliasGroup = GHCR_ORG_ALIASES.join("|");
-  t = t.replace(new RegExp(`^(${aliasGroup})\\/?`, "i"), "");
-  // ensure single slash and no trailing slash
+  const t = (txt || "").trim()
+    .replace(/^ghcr\.io\/?/i, "")
+    .replace(/^versa-node\/?/i, "");
   return (GHCR_NAMESPACE + t).replace(/\/+$/, "");
 };
 
@@ -59,33 +47,33 @@ URL="https://api.github.com/orgs/${GH_ORG}/packages?package_type=container&per_p
 HDR_ACCEPT="Accept: application/vnd.github+json"
 HDR_API="X-GitHub-Api-Version: 2022-11-28"
 HDR_UA="User-Agent: versanode-cockpit/1.0"
-TOKEN_FILE="/etc/versanode/github.token"
+TOKEN_FILE="\${VERSANODE_GHCR_TOKEN_FILE:-/etc/versanode/github.token}"
 
 if [ ! -r "$TOKEN_FILE" ]; then
-  echo "PAT file not found or unreadable at $TOKEN_FILE" >&2
   exit 40
 fi
 
-TOKEN="$(tr -d '\\r\\n' < "$TOKEN_FILE")"
+TOKEN="$(tr -d '\\r\\n' < "$TOKEN_FILE" || true)"
 if [ -z "$TOKEN" ]; then
-  echo "PAT file is empty" >&2
   exit 41
 fi
 
 curl -fsSL -H "$HDR_ACCEPT" -H "$HDR_API" -H "$HDR_UA" -H "Authorization: Bearer $TOKEN" "$URL"
 `;
-  const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
-  let pkgs;
   try {
-    pkgs = JSON.parse(out);
-  } catch (_e) {
-    throw new Error("Unexpected response from GitHub API (not JSON)");
+    const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "out" });
+    const pkgs = JSON.parse(out || "[]");
+    return (pkgs || []).map(p => ({
+      name: `ghcr.io/versa-node/${p.name}`,
+      description: p.description || "GitHub Container Registry (versa-node)",
+    }));
+  } catch (e) {
+    const msg = String(e.message || e);
+    if (/(403|Not permitted|denied|code 40|code 41)/i.test(msg)) {
+      return [];
+    }
+    throw e;
   }
-  // Map to list entries
-  return (pkgs || []).map(p => ({
-    name: `ghcr.io/versa-node/${p.name}`,
-    description: p.description || "GitHub Container Registry (versa-node)",
-  }));
 }
 
 export const ImageSearchModal = ({ downloadImage }) => {
@@ -99,14 +87,13 @@ export const ImageSearchModal = ({ downloadImage }) => {
   const [dialogError, setDialogError] = useState("");
   const [dialogErrorDetail, setDialogErrorDetail] = useState("");
   const [typingTimeout, setTypingTimeout] = useState(null);
-  const [ghcrOrgListing, setGhcrOrgListing] = useState(false); // show org list with empty input on ghcr
+  const [ghcrOrgListing, setGhcrOrgListing] = useState(false);
 
   const activeConnectionRef = useRef(null);
 
   const { registries } = useDockerInfo();
   const Dialogs = useDialogs();
 
-  // Registries to use for searching; make sure ghcr.io is present
   const baseRegistries =
     (registries?.search && registries.search.length !== 0)
       ? registries.search
@@ -121,15 +108,13 @@ export const ImageSearchModal = ({ downloadImage }) => {
     }
   };
 
-  // First open: if ghcr and empty query, list org packages
   useEffect(() => {
     if (selectedRegistry === "ghcr.io" && imageIdentifier.trim() === "") {
       onSearchTriggered("ghcr.io", true);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // once on mount
+  }, []);
 
-  // Switching registry to ghcr with empty query -> list org
   useEffect(() => {
     if (selectedRegistry === "ghcr.io" && imageIdentifier.trim() === "") {
       onSearchTriggered("ghcr.io", true);
@@ -137,7 +122,6 @@ export const ImageSearchModal = ({ downloadImage }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedRegistry]);
 
-  // Clearing input while on ghcr -> re-list org
   useEffect(() => {
     if (selectedRegistry === "ghcr.io" && imageIdentifier.trim() === "") {
       onSearchTriggered("ghcr.io", true);
@@ -145,17 +129,15 @@ export const ImageSearchModal = ({ downloadImage }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [imageIdentifier]);
 
-  // Don't use selectedRegistry state inside due to async; pass as arg.
   const onSearchTriggered = async (searchRegistry = "", forceSearch = false) => {
     setSearchFinished(false);
 
     const targetGhcr = isGhcr(searchRegistry) || isGhcrVersaNodeTerm(imageIdentifier);
     const typedRepo = imageIdentifier
-      .replace(/^ghcr\.io\/?(versa-node|versanode)\/?/i, "")
-      .replace(/^(versa-node|versanode)\/?/i, "")
+      .replace(/^ghcr\.io\/?versa-node\/?/i, "")
+      .replace(/^versa-node\/?/i, "")
       .trim();
 
-    // If GHCR targeted and no specific repo typed yet, list org packages via GitHub API (server-side)
     if (targetGhcr && typedRepo.length === 0) {
       setDialogError(""); setDialogErrorDetail("");
       setSearchInProgress(true);
@@ -177,7 +159,6 @@ export const ImageSearchModal = ({ downloadImage }) => {
       return;
     }
 
-    // If user typed a specific versa-node repo, synthesize the full name (no /images/search on GHCR)
     if (targetGhcr) {
       const fullName = buildGhcrVersaNodeName(imageIdentifier);
       const bareNamespace = GHCR_NAMESPACE.replace(/\/+$/, "");
@@ -195,7 +176,6 @@ export const ImageSearchModal = ({ downloadImage }) => {
       return;
     }
 
-    // Docker Hub (or registries that support /images/search)
     if (imageIdentifier.length < 2 && !forceSearch) {
       setGhcrOrgListing(false);
       return;
@@ -205,7 +185,6 @@ export const ImageSearchModal = ({ downloadImage }) => {
     setDialogError(""); setDialogErrorDetail("");
     setGhcrOrgListing(false);
 
-    // Close any previous connection, then open a fresh one
     closeActiveConnection();
     activeConnectionRef.current = rest.connect(client.getAddress());
 
@@ -214,9 +193,8 @@ export const ImageSearchModal = ({ downloadImage }) => {
       queryRegistries = [searchRegistry];
     }
 
-    // if a user searches for `docker.io/cockpit` let docker search in the user specified registry.
     if (imageIdentifier.includes('/')) {
-      queryRegistries = [""]; // let docker decide
+      queryRegistries = [""];
     }
 
     const searches = (queryRegistries || []).map(rr => {
@@ -225,9 +203,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
         method: "GET",
         path: client.VERSION + "/images/search",
         body: "",
-        params: {
-          term: registry + imageIdentifier
-        }
+        params: { term: registry + imageIdentifier }
       });
     });
 
@@ -257,7 +233,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
   };
 
   const onKeyDown = (e) => {
-    if (e.key !== ' ') { // Space should not trigger search
+    if (e.key !== ' ') {
       const forceSearch = e.key === 'Enter';
       if (forceSearch) e.preventDefault();
       clearTimeout(typingTimeout);
@@ -347,7 +323,6 @@ export const ImageSearchModal = ({ downloadImage }) => {
 
       {searchInProgress && <EmptyStatePanel loading title={_("Searching...")} /> }
 
-      {/* Initial state / instructions */}
       {!searchInProgress && !searchFinished && !ghcrOrgListing && imageIdentifier.trim() === "" && (
         <EmptyStatePanel
           title={_("No images found")}
@@ -355,7 +330,6 @@ export const ImageSearchModal = ({ downloadImage }) => {
         />
       )}
 
-      {/* Results */}
       {searchFinished && (
         <>
           {imageList.length === 0 && (
