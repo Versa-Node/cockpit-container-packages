@@ -12,7 +12,7 @@ import { NumberInput } from "@patternfly/react-core/dist/esm/components/NumberIn
 import { InputGroup, InputGroupText } from "@patternfly/react-core/dist/esm/components/InputGroup";
 import { TextInput } from "@patternfly/react-core/dist/esm/components/TextInput";
 import { Tab, TabTitleText, Tabs } from "@patternfly/react-core/dist/esm/components/Tabs";
-import { Text, TextContent, TextList, TextListItem, TextVariants } from "@patternfly/react-core/dist/esm/components/Text";
+import { Text } from "@patternfly/react-core/dist/esm/components/Text";
 import { ToggleGroup, ToggleGroupItem } from "@patternfly/react-core/dist/esm/components/ToggleGroup";
 import { Flex, FlexItem } from "@patternfly/react-core/dist/esm/layouts/Flex";
 import { Popover } from "@patternfly/react-core/dist/esm/components/Popover";
@@ -98,6 +98,7 @@ export class ImageRunModal extends React.Component {
             activeTabKey: 0,
             /* image select */
             selectedImage,
+            selectedTag: "latest",  // NEW: default tag picker
             searchFinished: false,
             searchInProgress: false,
             searchText: "",
@@ -134,12 +135,15 @@ export class ImageRunModal extends React.Component {
         createConfig.HostConfig = {};
 
         if (this.state.image) {
+            // Local/selected image object: use its tag as-is.
             createConfig.image = this.state.image.RepoTags.length > 0 ? this.state.image.RepoTags[0] : "";
         } else {
+            // Typeahead-selected (remote) name
             let img = this.state.selectedImage.Name;
-            // Make implicit :latest
+            const tag = (this.state.selectedTag || "latest").trim();
+            // If no tag explicitly provided in the typed name, apply selectedTag
             if (!img.includes(":")) {
-                img += ":latest";
+                img += `:${tag || "latest"}`;
             }
             createConfig.image = img;
         }
@@ -239,6 +243,7 @@ export class ImageRunModal extends React.Component {
                     client.postContainer("start", reply.Id, {})
                         .then(() => Dialogs.close())
                         .catch(ex => {
+                            // If container failed to start remove it so user can retry with same name.
                             client.delContainer(reply.Id, true)
                                 .then(() => {
                                     this.setState({
@@ -286,6 +291,7 @@ export class ImageRunModal extends React.Component {
             Dialogs.close();
             const tempImage = { ...createConfig };
 
+            // Assign temporary properties to allow rendering
             tempImage.Id = tempImage.name;
             tempImage.State = { Status: _("downloading") };
             tempImage.Created = new Date();
@@ -335,19 +341,23 @@ export class ImageRunModal extends React.Component {
     }
 
     handleTabClick = (event, tabIndex) => {
+        // Prevent the form from being submitted.
         event.preventDefault();
         this.setState({ activeTabKey: tabIndex });
     };
 
     onSearchTriggered = value => {
+        // Do not call the SearchImage API if the input string is not at least 2 chars,
         if (value.length < 2)
             return;
 
+        // Don't search for a value with a tag specified
         const patt = /:[\w|\d]+$/;
         if (patt.test(value)) {
             return;
         }
 
+        // GHCR (versa-node) synthetic result if footer toggled to ghcr.io or user typed versa-node/...
         const selectedIndex = this.state.searchByRegistry; // 'all' | 'local' | 'docker.io' | 'ghcr.io'
         const targetGhcr = selectedIndex === 'ghcr.io' || isGhcrVersaNodeTerm(value);
         if (targetGhcr) {
@@ -366,7 +376,7 @@ export class ImageRunModal extends React.Component {
                 dialogError: "",
                 dialogErrorDetail: "",
             });
-            return;
+            return; // do not call /images/search for GHCR
         }
 
         if (this.activeConnection)
@@ -376,6 +386,7 @@ export class ImageRunModal extends React.Component {
         this.activeConnection = rest.connect(client.getAddress());
         let searches = [];
 
+        // If registries configured search in them, or if a user searches for `docker.io/foo` let docker search in the user specified registry.
         if (Object.keys(this.props.dockerInfo.registries).length !== 0 || value.includes('/')) {
             searches.push(this.activeConnection.call({
                 method: "GET",
@@ -405,13 +416,16 @@ export class ImageRunModal extends React.Component {
                             imageResults = imageResults.concat(JSON.parse(result.value));
                         } else {
                             dialogError = _("Failed to search for new images");
+                            // TODO: add registry context, docker does not include it in the reply.
                             dialogErrorDetail = result.reason
                                 ? cockpit.format(_("Failed to search for images: $0"), result.reason.message)
                                 : _("Failed to search for images.");
                         }
                     }
+                    // Group images on registry
                     const images = {};
                     imageResults.forEach(image => {
+                        // Add Tag if it's there
                         image.toString = function imageToString() {
                             if (this.Tag) {
                                 return this.Name + ':' + this.Tag;
@@ -420,6 +434,8 @@ export class ImageRunModal extends React.Component {
                         };
 
                         let index = image.Index;
+
+                        // listTags results do not return the registry Index.
                         if (!index) {
                             index = image.Name.split('/')[0];
                         }
@@ -442,6 +458,7 @@ export class ImageRunModal extends React.Component {
     };
 
     clearImageSelection = () => {
+        // Reset command if it was prefilled
         let command = this.state.command;
         if (this.state.command === utils.quote_cmdline(this.state.selectedImage?.Command))
             command = "";
@@ -483,6 +500,7 @@ export class ImageRunModal extends React.Component {
     handleImageSelectInput = value => {
         this.setState({
             searchText: value,
+            // Reset searchFinished status when text input changes
             searchFinished: false,
             selectedImage: "",
         });
@@ -513,7 +531,9 @@ export class ImageRunModal extends React.Component {
             imageRegistries.push(this.state.searchByRegistry);
         }
 
+        // Strip out all non-allowed container image characters when filtering.
         let regexString = searchText.replace(/[^\w_.:-]/g, "");
+        // Strip image registry option if set.
         if (regexString.includes('/')) {
             regexString = searchText.replace(searchText.split('/')[0], '');
         }
@@ -541,8 +561,9 @@ export class ImageRunModal extends React.Component {
                     );
                 }
             })
-            .filter(group => group.length !== 0);
+            .filter(group => group.length !== 0); // filter out empty groups
 
+        // Remove <SelectGroup> when there is a filter selected.
         if (this.state.searchByRegistry !== 'all' && imageRegistries.length === 1 && results.length === 1) {
             return results[0].props.children;
         }
@@ -550,6 +571,7 @@ export class ImageRunModal extends React.Component {
         return results;
     };
 
+    // Similar to the output of docker search and docker's /images/search endpoint: show only the root domain.
     truncateRegistryDomain = (domain) => {
         const parts = domain.split('.');
         if (parts.length > 2) {
@@ -569,9 +591,10 @@ export class ImageRunModal extends React.Component {
 
     isFormInvalid = validationFailed => {
         const groupHasError = row => row && Object.values(row)
-            .filter(val => val)
-            .length > 0;
+            .filter(val => val) // Filter out empty/undefined properties
+            .length > 0; // If one field has error, the whole group (dynamicList) is invalid
 
+        // If at least one group is invalid, then the whole form is invalid
         return validationFailed.publish?.some(groupHasError) ||
             validationFailed.volumes?.some(groupHasError) ||
             validationFailed.env?.some(groupHasError) ||
@@ -638,6 +661,7 @@ export class ImageRunModal extends React.Component {
         return !this.isFormInvalid(validationFailed);
     }
 
+    /* Updates a validation object of the whole dynamic list's form (e.g. the whole port-mapping form) */
     dynamicListOnValidationChange = (key, value) => {
         const validationFailedDelta = { ...this.state.validationFailed };
 
@@ -752,6 +776,8 @@ export class ImageRunModal extends React.Component {
                             }
                         >
                             <Select
+                                // We are unable to set id of the input directly, the select component appends
+                                // '-select-typeahead' to toggleId.
                                 toggleId='create-image-image'
                                 isGrouped
                                 {...(this.state.searchInProgress && { loadingVariant: 'spinner' })}
@@ -765,6 +791,7 @@ export class ImageRunModal extends React.Component {
                                 placeholderText={_("Search string or container location")}
                                 onSelect={this.onImageSelect}
                                 onClear={this.clearImageSelection}
+                                // onFilter must be set or the spinner crashes
                                 onFilter={() => {}}
                                 onTypeaheadInputChanged={this.debouncedInputChanged}
                                 footer={footer}
@@ -773,6 +800,18 @@ export class ImageRunModal extends React.Component {
                                 {imageListOptions}
                             </Select>
                         </FormGroup>
+
+                        {/* NEW: Tag selector (simple text field) */}
+                        {!image && (
+                            <FormGroup fieldId='run-image-dialog-tag' label={_("Tag")}>
+                                <TextInput
+                                    id='run-image-dialog-tag'
+                                    value={dialogValues.selectedTag}
+                                    placeholder="latest"
+                                    onChange={(_, value) => this.onValueChanged('selectedTag', value)}
+                                />
+                            </FormGroup>
+                        )}
 
                         {(image || localImage) &&
                             <FormGroup fieldId="run-image-dialog-pull-latest-image">
@@ -1157,6 +1196,7 @@ export class ImageRunModal extends React.Component {
                 position="top"
                 variant="medium"
                 onClose={Dialogs.close}
+                // TODO: still not ideal on chromium https://github.com/patternfly/patternfly-react/issues/6471
                 onEscapePress={() => {
                     if (this.state.isImageSelectOpen) {
                         this.onImageSelectToggle(!this.state.isImageSelectOpen);
