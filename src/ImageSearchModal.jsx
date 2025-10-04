@@ -23,39 +23,52 @@ const _ = cockpit.gettext;
 // ---------- GHCR helpers (only versa-node) ----------
 const GH_ORG = "versa-node"; // org is case-insensitive in API paths
 const GHCR_NAMESPACE = "ghcr.io/versa-node/";
+
 const isGhcr = (reg) => (reg || "").trim().toLowerCase() === "ghcr.io";
+
+// user typed a GHCR versa-node reference? (either fully-qualified or org-prefixed)
 const isGhcrVersaNodeTerm = (term) =>
   /^ghcr\.io\/versa-node\/[^/]+/i.test(term || "") || /^versa-node\/[^/]+/i.test(term || "");
+
+// turn free text into the final ghcr.io/versa-node/<name>
 const buildGhcrVersaNodeName = (txt) => {
   const t = (txt || "").trim()
     .replace(/^ghcr\.io\/?/i, "")
     .replace(/^versa-node\/?/i, "");
   return (GHCR_NAMESPACE + t).replace(/\/+$/, "");
 };
-// strip "ghcr.io/" if present; return "versa-node/name"
-const repoPathForToken = (fullName) =>
-  (fullName || "").replace(/^ghcr\.io\//i, "").replace(/^\/+/, "");
 
-// ---------- Server-side helpers via cockpit.spawn ----------
-// Silent org list (falls back to [])
+// Extract repo name (no tag) from a ghcr.io/versa-node/* image ref
+const parseGhcrRepoName = (full) => {
+  if (!full) return "";
+  const noTag = full.split(':')[0];
+  return noTag.replace(/^ghcr\.io\/?versa-node\/?/i, "").replace(/^\/+/, "");
+};
+
+// Server-side (host) fetch via cockpit.spawn (avoids CSP).
+// If token file is missing or not permitted, return an empty list silently.
 async function fetchGhcrOrgPackagesViaSpawn() {
   const script = `
 set -euo pipefail
 URL="https://api.github.com/orgs/${GH_ORG}/packages?package_type=container&per_page=100"
 HDR_ACCEPT="Accept: application/vnd.github+json"
 HDR_API="X-GitHub-Api-Version: 2022-11-28"
-HDR_UA="User-Agent: versanode-cockpit/1.1"
+HDR_UA="User-Agent: versanode-cockpit/1.0"
 TOKEN_FILE="/etc/versanode/github.token"
 
-if [ -r "$TOKEN_FILE" ] && [ -s "$TOKEN_FILE" ]; then
-  TOKEN="$(tr -d '\\r\\n' < "$TOKEN_FILE")"
-  AUTH="-H Authorization: Bearer ${TOKEN}"
-else
-  AUTH=""
+if [ ! -r "$TOKEN_FILE" ]; then
+  echo "[]"
+  exit 0
+fi
+
+TOKEN="$(tr -d '\\r\\n' < "$TOKEN_FILE")"
+if [ -z "$TOKEN" ]; then
+  echo "[]"
+  exit 0
 fi
 
 set +e
-RESP="$(curl -fsSL -H "$HDR_ACCEPT" -H "$HDR_API" -H "$HDR_UA" $AUTH "$URL")"
+RESP="$(curl -fsSL -H "$HDR_ACCEPT" -H "$HDR_API" -H "$HDR_UA" -H "Authorization: Bearer $TOKEN" "$URL")"
 EC=$?
 set -e
 if [ $EC -ne 0 ] || [ -z "$RESP" ]; then
@@ -76,120 +89,112 @@ fi
   }
 }
 
-// Fetch available tags for a GHCR repo (public works anonymously)
-async function fetchGhcrTagsViaSpawn(fullName) {
-  const repo = repoPathForToken(fullName); // "versa-node/<name>"
+// Fetch a single GHCR package’s description from GitHub Packages API
+async function fetchGhcrPackageDescriptionViaSpawn(packageName) {
+  const safe = packageName.replace(/[^a-zA-Z0-9._-]/g, "");
   const script = `
 set -euo pipefail
-repo="${repo}"
-# Get a registry token (anonymous works for public)
-TOK_JSON="$(curl -fsSL "https://ghcr.io/token?service=ghcr.io&scope=repository:${repo}:pull")"
-TOKEN="$(python3 - <<'PY'
-import sys, json
-print(json.load(sys.stdin).get("token",""))
-PY
-<<< "$TOK_JSON")"
-test -n "$TOKEN" || { echo "[]"; exit 0; }
+PKG="${safe}"
+URL="https://api.github.com/orgs/${GH_ORG}/packages/container/${safe}"
+HDR_ACCEPT="Accept: application/vnd.github+json"
+HDR_API="X-GitHub-Api-Version: 2022-11-28"
+HDR_UA="User-Agent: versanode-cockpit/1.0"
+TOKEN_FILE="/etc/versanode/github.token"
 
-TAGS_JSON="$(curl -fsSL -H "Authorization: Bearer $TOKEN" "https://ghcr.io/v2/${repo}/tags/list?n=1000")"
-python3 - <<'PY' <<< "$TAGS_JSON"
+maybe_echo_empty() { echo ""; }
+
+if [ ! -r "$TOKEN_FILE" ]; then
+  maybe_echo_empty; exit 0
+fi
+TOKEN="$(tr -d '\\r\\n' < "$TOKEN_FILE")"
+if [ -z "$TOKEN" ]; then
+  maybe_echo_empty; exit 0
+fi
+
+set +e
+RESP="$(curl -fsSL -H "$HDR_ACCEPT" -H "$HDR_API" -H "$HDR_UA" -H "Authorization: Bearer $TOKEN" "$URL")"
+EC=$?
+set -e
+if [ $EC -ne 0 ] || [ -z "$RESP" ]; then
+  maybe_echo_empty
+else
+  # pull just .description
+  python3 - <<'PY'
 import sys, json
-print(json.dumps((json.load(sys.stdin) or {}).get("tags", []) or []))
+data=json.load(sys.stdin)
+print((data.get("description") or ""))
 PY
+fi
 `;
   try {
-    const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "try", err: "message" });
-    return JSON.parse(out || "[]");
-  } catch (_e) {
-    return [];
-  }
-}
-
-// Fetch OCI label org.opencontainers.image.description for repo:tag
-async function fetchGhcrOciDescriptionViaSpawn(fullName, tag="latest") {
-  const repo = repoPathForToken(fullName); // "versa-node/<name>"
-  const escTag = (tag || "latest").trim() || "latest";
-  const script = `
-set -euo pipefail
-repo="${repo}"
-ref_tag="${escTag}"
-# Acquire token (anon for public)
-TOK_JSON="$(curl -fsSL "https://ghcr.io/token?service=ghcr.io&scope=repository:${repo}:pull")"
-TOKEN="$(python3 - <<'PY'
-import sys, json
-print(json.load(sys.stdin).get("token",""))
-PY
-<<< "$TOK_JSON")"
-test -n "$TOKEN" || { echo ""; exit 0; }
-
-# Accept both list and single-manifest
-ACCEPT="application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json"
-MAN="$(curl -fsSL -H "Authorization: Bearer $TOKEN" -H "Accept: $ACCEPT" "https://ghcr.io/v2/${repo}/manifests/${ref_tag}")" || { echo ""; exit 0; }
-
-python3 - <<'PY' <<EOF
-import sys, json, urllib.request
-import base64
-
-repo = "${repo}"
-token = "${TOKEN}"
-man = json.loads("""${MAN}""")
-
-def http_get(url, accept=None):
-    req = urllib.request.Request(url)
-    req.add_header("Authorization", f"Bearer {token}")
-    if accept:
-        req.add_header("Accept", accept)
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return r.read()
-
-def cfg_from_digest(digest):
-    # Pull config blob and parse labels
-    cfg = json.loads(http_get(f"https://ghcr.io/v2/{repo}/blobs/{digest}"))
-    labels = (cfg.get("config") or {}).get("Labels") or {}
-    print(labels.get("org.opencontainers.image.description",""))
-    sys.exit(0)
-
-# OCI index or Docker manifest list
-if "manifests" in man:
-    # prefer amd64, else arm64, else first
-    prefer = ["amd64", "arm64"]
-    chosen = None
-    for arch in prefer:
-        for m in man["manifests"]:
-            plat = (m.get("platform") or {})
-            if plat.get("architecture") == arch:
-                chosen = m
-                break
-        if chosen:
-            break
-    if not chosen:
-        chosen = (man["manifests"] or [None])[0]
-    if not chosen:
-        print("")
-        sys.exit(0)
-    # fetch single-manifest to get config digest
-    acc = "application/vnd.docker.distribution.manifest.v2+json"
-    sm = json.loads(http_get(f"https://ghcr.io/v2/{repo}/manifests/{chosen['digest']}", acc))
-    cfg = (sm.get("config") or {}).get("digest")
-    if not cfg:
-        print("")
-        sys.exit(0)
-    cfg_from_digest(cfg)
-else:
-    # single-manifest already; read config
-    cfg = (man.get("config") or {}).get("digest")
-    if not cfg:
-        print("")
-        sys.exit(0)
-    cfg_from_digest(cfg)
-PY
-EOF
-`;
-  try {
-    const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "try", err: "message" });
+    const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message", input: "" });
     return (out || "").trim();
   } catch (_e) {
     return "";
+  }
+}
+
+// Fetch tags from GHCR Registry V2 API
+async function fetchGhcrTagsViaSpawn(fullName) {
+  const repo = parseGhcrRepoName(fullName);
+  if (!repo) return [];
+
+  // We try *without* token first (public). If it fails, we retry with token (if present).
+  const script = `
+set -euo pipefail
+REPO="${repo}"
+BASE="https://ghcr.io/v2/versa-node/${repo}/tags/list?n=200"
+UA="User-Agent: versanode-cockpit/1.0"
+
+try_no_auth() {
+  curl -fsSL -H "$1" "$2" || return 1
+}
+
+try_with_auth() {
+  local TOKEN_FILE="/etc/versanode/github.token"
+  if [ ! -r "$TOKEN_FILE" ]; then
+    return 1
+  fi
+  local T
+  T="$(tr -d '\\r\\n' < "$TOKEN_FILE")"
+  [ -z "$T" ] && return 1
+  curl -fsSL -H "$1" -H "Authorization: Bearer $T" "$2" || return 1
+}
+
+HDR="Accept: application/json"
+
+set +e
+RESP="$(try_no_auth "$UA" "$BASE")"
+EC=$?
+set -e
+
+if [ $EC -ne 0 ] || [ -z "$RESP" ]; then
+  set +e
+  RESP="$(try_with_auth "$UA" "$BASE")"
+  EC=$?
+  set -e
+fi
+
+if [ $EC -ne 0 ] || [ -z "$RESP" ]; then
+  echo '{"tags":[]}'
+else
+  echo "$RESP"
+fi
+`;
+  try {
+    const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
+    const parsed = JSON.parse(out || '{"tags":[]}');
+    const tags = Array.isArray(parsed.tags) ? parsed.tags : [];
+    // Put "latest" first if present, then others sorted desc by semver-ish name length fallback
+    const uniq = Array.from(new Set(tags));
+    uniq.sort((a, b) => {
+      if (a === 'latest') return -1;
+      if (b === 'latest') return 1;
+      return b.localeCompare(a, undefined, { numeric: true, sensitivity: 'base' });
+    });
+    return uniq;
+  } catch (_e) {
+    return [];
   }
 }
 
@@ -197,15 +202,20 @@ export const ImageSearchModal = ({ downloadImage }) => {
   const [searchInProgress, setSearchInProgress] = useState(false);
   const [searchFinished, setSearchFinished] = useState(false);
   const [imageIdentifier, setImageIdentifier] = useState('');
-  const [imageList, setImageList] = useState([]); // [{name, description}]
-  const [tags, setTags] = useState([]);           // tags for the currently selected GHCR image
-  const [imageTag, setImageTag] = useState("latest");
-  const [selectedRegistry, setSelectedRegistry] = useState("ghcr.io");
+  const [imageList, setImageList] = useState([]);
+  const [selectedRegistry, setSelectedRegistry] = useState("ghcr.io"); // default to ghcr
   const [selected, setSelected] = useState("");
   const [dialogError, setDialogError] = useState("");
   const [dialogErrorDetail, setDialogErrorDetail] = useState("");
   const [typingTimeout, setTypingTimeout] = useState(null);
-  const [ghcrOrgListing, setGhcrOrgListing] = useState(false);
+  const [ghcrOrgListing, setGhcrOrgListing] = useState(false); // show results even with empty input
+
+  // Tag handling
+  const [tagOptions, setTagOptions] = useState([]);
+  const [tagLoading, setTagLoading] = useState(false);
+  const [tagError, setTagError] = useState("");
+  const [selectedTag, setSelectedTag] = useState("latest");
+  const [customTag, setCustomTag] = useState("");
 
   const activeConnectionRef = useRef(null);
 
@@ -217,6 +227,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
     (registries?.search && registries.search.length !== 0)
       ? registries.search
       : fallbackRegistries;
+
   const mergedRegistries = Array.from(new Set(["ghcr.io", ...(baseRegistries || [])]));
 
   const closeActiveConnection = () => {
@@ -226,59 +237,15 @@ export const ImageSearchModal = ({ downloadImage }) => {
     }
   };
 
-  // Enrich a GHCR image item with OCI description (latest)
-  const enrichOneWithOciDescription = async (item) => {
-    const desc = await fetchGhcrOciDescriptionViaSpawn(item.name, "latest");
-    if (desc) {
-      setImageList(prev =>
-        prev.map(x => x.name === item.name ? { ...x, description: desc } : x)
-      );
-    }
-  };
-
-  // For ghcr org list: fetch descriptions in background (don’t block UI)
-  const enrichAllGhcr = async (items) => {
-    items.forEach(it => { void enrichOneWithOciDescription(it); });
-  };
-
-  // When user selects a GHCR image row, fetch its tags (combobox) and tighten description to selected tag
-  const onRowSelected = async (idx) => {
-    setSelected(idx);
-    const item = imageList[idx];
-    if (!item) return;
-
-    if (isGhcrVersaNodeTerm(item.name)) {
-      // load tags
-      const t = await fetchGhcrTagsViaSpawn(item.name);
-      setTags(t || []);
-      // prefer latest if available
-      if (t && t.length) {
-        const prefer = t.includes("latest") ? "latest" : t[0];
-        setImageTag(prefer);
-        // update description for that tag (if available)
-        const d = await fetchGhcrOciDescriptionViaSpawn(item.name, prefer);
-        if (d) {
-          setImageList(prev =>
-            prev.map(x => x.name === item.name ? { ...x, description: d } : x)
-          );
-        }
-      } else {
-        setTags([]);
-      }
-    } else {
-      setTags([]);
-    }
-  };
-
-  // Trigger a fetch on first open if ghcr is selected and the box is empty
+  // On first open, list org packages if ghcr selected and empty query
   useEffect(() => {
     if (selectedRegistry === "ghcr.io" && imageIdentifier.trim() === "") {
       onSearchTriggered("ghcr.io", true);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // run once on mount
+  }, []);
 
-  // If user switches to ghcr.io and the query is empty, list org packages
+  // If switching to ghcr with empty query, list org packages
   useEffect(() => {
     if (selectedRegistry === "ghcr.io" && imageIdentifier.trim() === "") {
       onSearchTriggered("ghcr.io", true);
@@ -286,7 +253,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedRegistry]);
 
-  // Also, if the user clears the input while on ghcr, re-list the org
+  // If clearing query while on ghcr, re-list org packages
   useEffect(() => {
     if (selectedRegistry === "ghcr.io" && imageIdentifier.trim() === "") {
       onSearchTriggered("ghcr.io", true);
@@ -294,9 +261,62 @@ export const ImageSearchModal = ({ downloadImage }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [imageIdentifier]);
 
+  // Whenever selection changes, fetch tags/description for GHCR images
+  useEffect(() => {
+    const idx = (selected || "") === "" ? -1 : parseInt(selected, 10);
+    if (Number.isNaN(idx) || idx < 0 || idx >= imageList.length) return;
+    const img = imageList[idx];
+    if (!img?.name) return;
+
+    const isVersaNodeGhcr = /^ghcr\.io\/versa-node\//i.test(img.name);
+    // Reset tag UI
+    setTagOptions([]);
+    setSelectedTag("latest");
+    setCustomTag("");
+    setTagError("");
+
+    if (isVersaNodeGhcr) {
+      // Fetch tags
+      (async () => {
+        setTagLoading(true);
+        try {
+          const tags = await fetchGhcrTagsViaSpawn(img.name);
+          setTagOptions(tags);
+          // Keep "latest" if present, otherwise use first available tag
+          if (tags.length > 0) {
+            setSelectedTag(tags.includes("latest") ? "latest" : tags[0]);
+          }
+        } catch (e) {
+          setTagOptions([]);
+          setTagError(e?.message || String(e));
+        } finally {
+          setTagLoading(false);
+        }
+      })();
+
+      // If description is generic, try to enrich from Packages API
+      if (!img.description || /GitHub Container Registry \(versa-node\)/i.test(img.description)) {
+        (async () => {
+          const repo = parseGhcrRepoName(img.name);
+          if (!repo) return;
+          const desc = await fetchGhcrPackageDescriptionViaSpawn(repo);
+          if (desc) {
+            setImageList((prev) => {
+              const next = [...prev];
+              if (next[idx] && next[idx].name === img.name) {
+                next[idx] = { ...next[idx], description: desc };
+              }
+              return next;
+            });
+          }
+        })();
+      }
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selected]);
+
   const onSearchTriggered = async (searchRegistry = "", forceSearch = false) => {
     setSearchFinished(false);
-    setDialogError(""); setDialogErrorDetail("");
 
     const targetGhcr = isGhcr(searchRegistry) || isGhcrVersaNodeTerm(imageIdentifier);
     const typedRepo = imageIdentifier
@@ -304,40 +324,33 @@ export const ImageSearchModal = ({ downloadImage }) => {
       .replace(/^versa-node\/?/i, "")
       .trim();
 
-    // GHCR org listing
+    // If GHCR targeted and no specific repo typed yet, try listing org packages (no error if not permitted)
     if (targetGhcr && typedRepo.length === 0) {
+      setDialogError(""); setDialogErrorDetail("");
       setSearchInProgress(true);
       setGhcrOrgListing(true);
-      const pkgs = await fetchGhcrOrgPackagesViaSpawn();
-      setImageList(pkgs);
-      setSelected(pkgs.length ? "0" : "");
-      setTags([]);
-      setImageTag("latest");
-      setSearchInProgress(false);
-      setSearchFinished(true);
-      // Enrich with OCI descriptions (latest) in background
-      void enrichAllGhcr(pkgs);
+      try {
+        const pkgs = await fetchGhcrOrgPackagesViaSpawn();
+        setImageList(pkgs);
+        setSelected(pkgs.length ? "0" : "");
+      } finally {
+        setSearchInProgress(false);
+        setSearchFinished(true);
+      }
       closeActiveConnection();
       return;
     }
 
-    // GHCR direct: user typed repo
+    // If user typed a specific versa-node repo, synthesize the full name (no /images/search on GHCR)
     if (targetGhcr) {
       const fullName = buildGhcrVersaNodeName(imageIdentifier);
       const bareNamespace = GHCR_NAMESPACE.replace(/\/+$/, "");
       if (!fullName || fullName === bareNamespace) {
-        setImageList([]); setSelected(""); setTags([]); setImageTag("latest");
+        setImageList([]);
+        setSelected("");
       } else {
-        const baseItem = { name: fullName, description: _("GitHub Container Registry (versa-node)") };
-        setImageList([baseItem]);
+        setImageList([{ name: fullName, description: _("GitHub Container Registry (versa-node)") }]);
         setSelected("0");
-        // load tags & description for latest
-        const t = await fetchGhcrTagsViaSpawn(fullName);
-        setTags(t || []);
-        const prefer = (t && t.length) ? (t.includes("latest") ? "latest" : t[0]) : "latest";
-        setImageTag(prefer);
-        const desc = await fetchGhcrOciDescriptionViaSpawn(fullName, prefer);
-        if (desc) setImageList([{ ...baseItem, description: desc }]);
       }
       setGhcrOrgListing(false);
       setSearchInProgress(false);
@@ -346,21 +359,27 @@ export const ImageSearchModal = ({ downloadImage }) => {
       return;
     }
 
-    // Docker Hub / others (use /images/search via Docker API)
+    // Docker Hub (or registries that support /images/search)
     if (imageIdentifier.length < 2 && !forceSearch) {
       setGhcrOrgListing(false);
       return;
     }
 
     setSearchInProgress(true);
+    setDialogError(""); setDialogErrorDetail("");
     setGhcrOrgListing(false);
 
     closeActiveConnection();
     activeConnectionRef.current = rest.connect(client.getAddress());
 
     let queryRegistries = baseRegistries;
-    if (searchRegistry !== "") queryRegistries = [searchRegistry];
-    if (imageIdentifier.includes('/')) queryRegistries = [""];
+    if (searchRegistry !== "") {
+      queryRegistries = [searchRegistry];
+    }
+
+    if (imageIdentifier.includes('/')) {
+      queryRegistries = [""];
+    }
 
     const searches = (queryRegistries || []).map(rr => {
       const registry = rr.length < 1 || rr[rr.length - 1] === "/" ? rr : rr + "/";
@@ -374,33 +393,24 @@ export const ImageSearchModal = ({ downloadImage }) => {
 
     try {
       const reply = await Promise.allSettled(searches);
-      let results = [];
-      for (const r of reply) {
-        if (r.status === "fulfilled") {
-          results = results.concat(JSON.parse(r.value));
-        } else if (!dialogError) {
-          setDialogError(_("Failed to search for new images"));
-          setDialogErrorDetail(r.reason
-            ? cockpit.format(_("Failed to search for images: $0"), r.reason.message)
-            : _("Failed to search for images."));
+      if (reply) {
+        let results = [];
+        for (const result of reply) {
+          if (result.status === "fulfilled") {
+            results = results.concat(JSON.parse(result.value));
+          } else {
+            setDialogError(_("Failed to search for new images"));
+            setDialogErrorDetail(result.reason
+              ? cockpit.format(_("Failed to search for images: $0"), result.reason.message)
+              : _("Failed to search for images."));
+          }
         }
+        setImageList(results || []);
+        setSelected(results.length ? "0" : "");
       }
-      // Normalize to [{name, description}]
-      const norm = (results || []).map(it => ({
-        name: it?.Name || "",
-        description: it?.Description || ""
-      }));
-      setImageList(norm);
-      setSelected(norm.length ? "0" : "");
-      setTags([]);
-      setImageTag("latest");
     } catch (err) {
       setDialogError(_("Failed to search for new images"));
       setDialogErrorDetail(err?.message || String(err));
-      setImageList([]);
-      setSelected("");
-      setTags([]);
-      setImageTag("latest");
     } finally {
       setSearchInProgress(false);
       setSearchFinished(true);
@@ -421,13 +431,66 @@ export const ImageSearchModal = ({ downloadImage }) => {
     const selectedImageName = imageList[selected].name;
     closeActiveConnection();
     Dialogs.close();
-    const tag = (imageTag || "").trim() || "latest";
+    const tag = tagOptions.length > 0
+      ? (selectedTag || "latest")
+      : ((customTag || "").trim() || "latest");
     downloadImage(selectedImageName, tag);
   };
 
   const handleClose = () => {
     closeActiveConnection();
     Dialogs.close();
+  };
+
+  // Tag picker UI: show a combobox (FormSelect) when we have tagOptions; else fallback to text input.
+  const TagPicker = () => {
+    if (tagLoading) {
+      return (
+        <FormGroup fieldId="image-search-tag" label={_("Tag")}>
+          <TextInput
+            id="image-search-tag"
+            type="text"
+            isDisabled
+            value={_("Loading…")}
+            aria-label="loading tags"
+          />
+        </FormGroup>
+      );
+    }
+    if (tagOptions.length > 0) {
+      return (
+        <FormGroup fieldId="image-search-tag-select" label={_("Tag")}>
+          <FormSelect
+            id="image-search-tag-select"
+            value={selectedTag}
+            onChange={(_e, val) => setSelectedTag(val)}
+          >
+            {tagOptions.map(t => (
+              <FormSelectOption key={t} value={t} label={t} />
+            ))}
+          </FormSelect>
+        </FormGroup>
+      );
+    }
+    // No tags available or non-GHCR registry: free text
+    return (
+      <FormGroup fieldId="image-search-tag-text" label={_("Tag")}>
+        <TextInput
+          className="image-tag-entry"
+          id="image-search-tag-text"
+          type="text"
+          placeholder="latest"
+          value={customTag}
+          onChange={(_event, value) => setCustomTag(value)}
+        />
+        {/* Optional inline note on errors */}
+        {tagError && (
+          <div className="pf-v5-c-form__helper-text pf-m-error" aria-live="polite">
+            {_("Could not list tags; enter one manually.")}
+          </div>
+        )}
+      </FormGroup>
+    );
   };
 
   return (
@@ -441,28 +504,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
       footer={
         <>
           <Form isHorizontal className="image-search-tag-form">
-            <FormGroup fieldId="image-search-tag" label={_("Tag")}>
-              {tags && tags.length > 0 ? (
-                <FormSelect
-                  id="image-search-tag"
-                  value={imageTag}
-                  onChange={(_ev, value) => setImageTag(value)}
-                >
-                  {tags.map(t => (
-                    <FormSelectOption value={t} key={t} label={t} />
-                  ))}
-                </FormSelect>
-              ) : (
-                <TextInput
-                  className="image-tag-entry"
-                  id="image-search-tag"
-                  type="text"
-                  placeholder="latest"
-                  value={imageTag}
-                  onChange={(_event, value) => setImageTag(value)}
-                />
-              )}
-            </FormGroup>
+            <TagPicker />
           </Form>
           <Button variant="primary" isDisabled={selected === ""} onClick={onDownloadClicked}>
             {_("Download")}
@@ -531,7 +573,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
             <DataList
               isCompact
               selectedDataListItemId={"image-list-item-" + selected}
-              onSelectDataListItem={(_, key) => onRowSelected(key.split('-').slice(-1)[0])}
+              onSelectDataListItem={(_, key) => setSelected(key.split('-').slice(-1)[0])}
             >
               {imageList.map((image, iter) => (
                 <DataListItem id={"image-list-item-" + iter} key={iter} className="image-list-item">
@@ -542,7 +584,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
                           <span className="image-name">{image.name}</span>
                         </DataListCell>,
                         <DataListCell key="secondary content" wrapModifier="truncate">
-                          <span className="image-description">{image.description}</span>
+                          <span className="image-description">{image.description || ""}</span>
                         </DataListCell>
                       ]}
                     />
