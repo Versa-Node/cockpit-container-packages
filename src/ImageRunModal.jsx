@@ -1,59 +1,36 @@
-import React from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { Button } from "@patternfly/react-core/dist/esm/components/Button";
-import { Checkbox } from "@patternfly/react-core/dist/esm/components/Checkbox";
+import { DataList, DataListCell, DataListItem, DataListItemCells, DataListItemRow } from "@patternfly/react-core/dist/esm/components/DataList";
+import { Flex } from "@patternfly/react-core/dist/esm/layouts/Flex";
 import { Form, FormGroup } from "@patternfly/react-core/dist/esm/components/Form";
-import { FormHelper } from "cockpit-components-form-helper.jsx";
 import { FormSelect, FormSelectOption } from "@patternfly/react-core/dist/esm/components/FormSelect";
-import { Grid, GridItem } from "@patternfly/react-core/dist/esm/layouts/Grid";
 import { Modal } from "@patternfly/react-core/dist/esm/components/Modal";
-import { Radio } from "@patternfly/react-core/dist/esm/components/Radio";
-import { Select, SelectGroup, SelectOption, SelectVariant } from "@patternfly/react-core/dist/esm/deprecated/components/Select";
-import { NumberInput } from "@patternfly/react-core/dist/esm/components/NumberInput";
-import { InputGroup, InputGroupText } from "@patternfly/react-core/dist/esm/components/InputGroup";
 import { TextInput } from "@patternfly/react-core/dist/esm/components/TextInput";
-import { Tab, TabTitleText, Tabs } from "@patternfly/react-core/dist/esm/components/Tabs";
-import { Text } from "@patternfly/react-core/dist/esm/components/Text";
-import { ToggleGroup, ToggleGroupItem } from "@patternfly/react-core/dist/esm/components/ToggleGroup";
-import { Flex, FlexItem } from "@patternfly/react-core/dist/esm/layouts/Flex";
-import { Popover } from "@patternfly/react-core/dist/esm/components/Popover";
-import { OutlinedQuestionCircleIcon } from '@patternfly/react-icons';
-import * as dockerNames from 'docker-names';
+import { ExclamationCircleIcon } from '@patternfly/react-icons';
 
+import { EmptyStatePanel } from "cockpit-components-empty-state.jsx";
 import { ErrorNotification } from './Notification.jsx';
-import * as utils from './util.js';
-import * as client from './client.js';
-import rest from './rest.js';
 import cockpit from 'cockpit';
-import { onDownloadContainer, onDownloadContainerFinished } from './Containers.jsx';
-import { PublishPort, validatePublishPort } from './PublishPort.jsx';
-import { DynamicListForm } from 'cockpit-components-dynamic-list.jsx';
-import { validateVolume, Volume } from './Volume.jsx';
-import { EnvVar, validateEnvVar } from './Env.jsx';
+import rest from './rest.js';
+import * as client from './client.js';
+import { fallbackRegistries, useDockerInfo } from './util.js';
+import { useDialogs } from "dialogs.jsx";
 
-import { debounce } from 'throttle-debounce';
-
-import "./ImageRunModal.scss";
+import './ImageSearchModal.css';
 
 const _ = cockpit.gettext;
 
-const units = {
-    KB: { name: "KB", baseExponent: 1 },
-    MB: { name: "MB", baseExponent: 2 },
-    GB: { name: "GB", baseExponent: 3 },
-};
-
-// healthchecks.go HealthCheckOnFailureAction
-const HealthCheckOnFailureActionOrder = [
-    { value: 0, label: _("No action") },
-    { value: 3, label: _("Restart") },
-    { value: 4, label: _("Stop") },
-    { value: 2, label: _("Force stop") },
-];
-
-// ---- GHCR helpers (versa-node) ----
+// ---------- GHCR helpers (only versa-node) ----------
+const GH_ORG = "versa-node"; // org is case-insensitive in API paths
 const GHCR_NAMESPACE = "ghcr.io/versa-node/";
+
+const isGhcr = (reg) => (reg || "").trim().toLowerCase() === "ghcr.io";
+
+// user typed a GHCR versa-node reference? (either fully-qualified or org-prefixed)
 const isGhcrVersaNodeTerm = (term) =>
   /^ghcr\.io\/versa-node\/[^/]+/i.test(term || "") || /^versa-node\/[^/]+/i.test(term || "");
+
+// turn free text into the final ghcr.io/versa-node/<name>
 const buildGhcrVersaNodeName = (txt) => {
   const t = (txt || "").trim()
     .replace(/^ghcr\.io\/?/i, "")
@@ -61,1176 +38,842 @@ const buildGhcrVersaNodeName = (txt) => {
   return (GHCR_NAMESPACE + t).replace(/\/+$/, "");
 };
 
-export class ImageRunModal extends React.Component {
-    constructor(props) {
-        super(props);
-
-        let command = "";
-        if (this.props.image && this.props.image.Command) {
-            command = utils.quote_cmdline(this.props.image.Command);
-        }
-
-        const entrypoint = utils.quote_cmdline(this.props.image?.Entrypoint);
-
-        let selectedImage = "";
-        if (this.props.image) {
-            selectedImage = utils.image_name(this.props.image);
-        }
-
-        this.state = {
-            command,
-            containerName: dockerNames.getRandomName(),
-            entrypoint,
-            env: [],
-            hasTTY: true,
-            publish: [],
-            image: props.image,
-            memory: 512,
-            cpuShares: 1024,
-            memoryConfigure: false,
-            cpuSharesConfigure: false,
-            memoryUnit: 'MB',
-            validationFailed: {},
-            volumes: [],
-            restartPolicy: "no",
-            restartTries: 5,
-            pullLatestImage: false,
-            activeTabKey: 0,
-            /* image select */
-            selectedImage,
-            selectedTag: "latest",  // NEW: default tag picker
-            searchFinished: false,
-            searchInProgress: false,
-            searchText: "",
-            imageResults: {},
-            isImageSelectOpen: false,
-            searchByRegistry: 'all', // 'all' | 'local' | 'docker.io' | 'ghcr.io'
-            /* health check */
-            healthcheck_command: "",
-            healthcheck_shell: false,
-            healthcheck_interval: 30,
-            healthcheck_timeout: 30,
-            healthcheck_start_period: 0,
-            healthcheck_retries: 3,
-            healthcheck_action: 0,
-        };
-        this.getCreateConfig = this.getCreateConfig.bind(this);
-        this.onValueChanged = this.onValueChanged.bind(this);
-    }
-
-    componentDidMount() {
-        this._isMounted = true;
-        this.onSearchTriggered(this.state.searchText);
-    }
-
-    componentWillUnmount() {
-        this._isMounted = false;
-
-        if (this.activeConnection)
-            this.activeConnection.close();
-    }
-
-    getCreateConfig() {
-        const createConfig = {};
-        createConfig.HostConfig = {};
-
-        if (this.state.image) {
-            // Local/selected image object: use its tag as-is.
-            createConfig.image = this.state.image.RepoTags.length > 0 ? this.state.image.RepoTags[0] : "";
-        } else {
-            // Typeahead-selected (remote) name
-            let img = this.state.selectedImage.Name;
-            const tag = (this.state.selectedTag || "latest").trim();
-            // If no tag explicitly provided in the typed name, apply selectedTag
-            if (!img.includes(":")) {
-                img += `:${tag || "latest"}`;
-            }
-            createConfig.image = img;
-        }
-
-        if (this.state.containerName)
-            createConfig.name = this.state.containerName;
-
-        if (this.state.command)
-            createConfig.command = utils.unquote_cmdline(this.state.command);
-
-        if (this.state.memoryConfigure && this.state.memory) {
-            const memorySize = this.state.memory * (1000 ** units[this.state.memoryUnit].baseExponent);
-            createConfig.HostConfig.Memory = memorySize;
-        }
-
-        if (this.state.cpuSharesConfigure && parseInt(this.state.cpuShares) !== 0)
-            createConfig.HostConfig.CpuShares = parseInt(this.state.cpuShares);
-
-        createConfig.terminal = this.state.hasTTY;
-
-        if (this.state.publish.some(port => port !== undefined)) {
-            const PortBindings = {};
-            const ExposedPorts = {};
-            this.state.publish
-                .filter(port => port?.containerPort)
-                .forEach(item => {
-                    ExposedPorts[item.containerPort + "/" + item.protocol] = {};
-                    const mapping = { HostPort: item.hostPort };
-                    if (item.IP)
-                        mapping.HostIp = item.IP;
-                    PortBindings[item.containerPort + "/" + item.protocol] = [mapping];
-                });
-
-            createConfig.HostConfig.PortBindings = PortBindings;
-            createConfig.ExposedPorts = ExposedPorts;
-        }
-
-        if (this.state.env.some(item => item !== undefined)) {
-            const envs = [];
-            this.state.env.forEach(item => {
-                if (item !== undefined)
-                    envs.push(item.envKey + "=" + item.envValue);
-            });
-            createConfig.Env = envs;
-        }
-
-        if (this.state.volumes.some(volume => volume !== undefined)) {
-            createConfig.HostConfig.mounts = this.state.volumes
-                .filter(volume => volume?.hostPath && volume?.containerPath)
-                .map(volume => {
-                    return {
-                        Source: volume.hostPath,
-                        Target: volume.containerPath,
-                        Type: "bind",
-                        ReadOnly: volume.ReadOnly
-                    };
-                });
-        }
-
-        if (this.state.restartPolicy !== "no") {
-            createConfig.HostConfig.RestartPolicy = { Name: this.state.restartPolicy };
-            if (this.state.restartPolicy === "on-failure" && this.state.restartTries !== null) {
-                createConfig.HostConfig.RestartPolicy.MaximumRetryCount = parseInt(this.state.restartTries);
-            }
-            if (this.state.restartPolicy === "always" && (this.props.serviceAvailable)) {
-                this.enableDockerRestartService();
-            }
-        }
-
-        if (this.state.healthcheck_command !== "") {
-            const test = utils.unquote_cmdline(this.state.healthcheck_command);
-            if (this.state.healthcheck_shell) {
-                test.unshift("CMD-SHELL");
-            } else {
-                test.unshift("CMD");
-            }
-            createConfig.Healthcheck = {
-                Interval: parseInt(this.state.healthcheck_interval) * 1000000000,
-                Retries: this.state.healthcheck_retries,
-                StartPeriod: parseInt(this.state.healthcheck_start_period) * 1000000000,
-                Test: test,
-                Timeout: parseInt(this.state.healthcheck_timeout) * 1000000000,
-            };
-            createConfig.health_check_on_failure_action = parseInt(this.state.healthcheck_action);
-        }
-
-        console.log("createConfig", createConfig);
-
-        return createConfig;
-    }
-
-    createContainer = (createConfig, runImage) => {
-        const Dialogs = this.props.dialogs;
-        client.createContainer(createConfig)
-            .then(reply => {
-                if (runImage) {
-                    client.postContainer("start", reply.Id, {})
-                        .then(() => Dialogs.close())
-                        .catch(ex => {
-                            // If container failed to start remove it so user can retry with same name.
-                            client.delContainer(reply.Id, true)
-                                .then(() => {
-                                    this.setState({
-                                        dialogError: _("Container failed to be started"),
-                                        dialogErrorDetail: cockpit.format("$0: $1", ex.reason, ex.message)
-                                    });
-                                })
-                                .catch(ex => {
-                                    this.setState({
-                                        dialogError: _("Failed to clean up container"),
-                                        dialogErrorDetail: cockpit.format("$0: $1", ex.reason, ex.message)
-                                    });
-                                });
-                        });
-                } else {
-                    Dialogs.close();
-                }
-            })
-            .catch(ex => {
-                this.setState({
-                    dialogError: _("Container failed to be created"),
-                    dialogErrorDetail: cockpit.format("$0: $1", ex.reason, ex.message)
-                });
-            });
-    };
-
-    async onCreateClicked(runImage = false) {
-        if (!await this.validateForm())
-            return;
-
-        const Dialogs = this.props.dialogs;
-        const createConfig = this.getCreateConfig();
-        const { pullLatestImage } = this.state;
-        let imageExists = true;
-
-        try {
-            await client.imageExists(createConfig.image);
-        } catch (error) {
-            imageExists = false;
-        }
-
-        if (imageExists && !pullLatestImage) {
-            this.createContainer(createConfig, runImage);
-        } else {
-            Dialogs.close();
-            const tempImage = { ...createConfig };
-
-            // Assign temporary properties to allow rendering
-            tempImage.Id = tempImage.name;
-            tempImage.State = { Status: _("downloading") };
-            tempImage.Created = new Date();
-            tempImage.Name = [tempImage.name];
-            tempImage.Image = createConfig.image;
-            tempImage.isDownloading = true;
-
-            onDownloadContainer(tempImage);
-
-            client.pullImage(createConfig.image).then(reply => {
-                client.createContainer(createConfig)
-                    .then(reply => {
-                        if (runImage) {
-                            client.postContainer("start", reply.Id, {})
-                                .then(() => onDownloadContainerFinished(createConfig))
-                                .catch(ex => {
-                                    onDownloadContainerFinished(createConfig);
-                                    const error = cockpit.format(_("Failed to run container $0"), tempImage.name);
-                                    this.props.onAddNotification({ type: 'danger', error, errorDetail: ex.message });
-                                });
-                        }
-                    })
-                    .catch(ex => {
-                        onDownloadContainerFinished(createConfig);
-                        const error = cockpit.format(_("Failed to create container $0"), tempImage.name);
-                        this.props.onAddNotification({ type: 'danger', error, errorDetail: ex.reason });
-                    });
-            })
-                .catch(ex => {
-                    onDownloadContainerFinished(createConfig);
-                    const error = cockpit.format(_("Failed to pull image $0"), tempImage.image);
-                    this.props.onAddNotification({ type: 'danger', error, errorDetail: ex.message });
-                });
-        }
-    }
-
-    onValueChanged(key, value) {
-        this.setState({ [key]: value });
-    }
-
-    onPlusOne(key) {
-        this.setState(state => ({ [key]: parseInt(state[key]) + 1 }));
-    }
-
-    onMinusOne(key) {
-        this.setState(state => ({ [key]: parseInt(state[key]) - 1 }));
-    }
-
-    handleTabClick = (event, tabIndex) => {
-        // Prevent the form from being submitted.
-        event.preventDefault();
-        this.setState({ activeTabKey: tabIndex });
-    };
-
-    onSearchTriggered = value => {
-        // Do not call the SearchImage API if the input string is not at least 2 chars,
-        if (value.length < 2)
-            return;
-
-        // Don't search for a value with a tag specified
-        const patt = /:[\w|\d]+$/;
-        if (patt.test(value)) {
-            return;
-        }
-
-        // GHCR (versa-node) synthetic result if footer toggled to ghcr.io or user typed versa-node/...
-        const selectedIndex = this.state.searchByRegistry; // 'all' | 'local' | 'docker.io' | 'ghcr.io'
-        const targetGhcr = selectedIndex === 'ghcr.io' || isGhcrVersaNodeTerm(value);
-        if (targetGhcr) {
-            const name = buildGhcrVersaNodeName(value);
-            const images = name && name !== GHCR_NAMESPACE.replace(/\/+$/, "")
-                ? { "ghcr.io": [{ Name: name, Description: "GitHub Container Registry (versa-node)" }] }
-                : { "ghcr.io": [] };
-
-            if (this.activeConnection)
-                this.activeConnection.close();
-
-            this.setState({
-                imageResults: images,
-                searchFinished: true,
-                searchInProgress: false,
-                dialogError: "",
-                dialogErrorDetail: "",
-            });
-            return; // do not call /images/search for GHCR
-        }
-
-        if (this.activeConnection)
-            this.activeConnection.close();
-
-        this.setState({ searchFinished: false, searchInProgress: true });
-        this.activeConnection = rest.connect(client.getAddress());
-        let searches = [];
-
-        // If registries configured search in them, or if a user searches for `docker.io/foo` let docker search in the user specified registry.
-        if (Object.keys(this.props.dockerInfo.registries).length !== 0 || value.includes('/')) {
-            searches.push(this.activeConnection.call({
-                method: "GET",
-                path: client.VERSION + "/images/search",
-                body: "",
-                params: { term: value }
-            }));
-        } else {
-            searches = searches.concat(utils.fallbackRegistries.map(registry =>
-                this.activeConnection.call({
-                    method: "GET",
-                    path: client.VERSION + "/images/search",
-                    body: "",
-                    params: { term: registry + "/" + value }
-                })));
-        }
-
-        Promise.allSettled(searches)
-            .then(reply => {
-                if (reply && this._isMounted) {
-                    let imageResults = [];
-                    let dialogError = "";
-                    let dialogErrorDetail = "";
-
-                    for (const result of reply) {
-                        if (result.status === "fulfilled") {
-                            imageResults = imageResults.concat(JSON.parse(result.value));
-                        } else {
-                            dialogError = _("Failed to search for new images");
-                            // TODO: add registry context, docker does not include it in the reply.
-                            dialogErrorDetail = result.reason
-                                ? cockpit.format(_("Failed to search for images: $0"), result.reason.message)
-                                : _("Failed to search for images.");
-                        }
-                    }
-                    // Group images on registry
-                    const images = {};
-                    imageResults.forEach(image => {
-                        // Add Tag if it's there
-                        image.toString = function imageToString() {
-                            if (this.Tag) {
-                                return this.Name + ':' + this.Tag;
-                            }
-                            return this.Name;
-                        };
-
-                        let index = image.Index;
-
-                        // listTags results do not return the registry Index.
-                        if (!index) {
-                            index = image.Name.split('/')[0];
-                        }
-
-                        if (index in images) {
-                            images[index].push(image);
-                        } else {
-                            images[index] = [image];
-                        }
-                    });
-                    this.setState({
-                        imageResults: images || {},
-                        searchFinished: true,
-                        searchInProgress: false,
-                        dialogError,
-                        dialogErrorDetail,
-                    });
-                }
-            });
-    };
-
-    clearImageSelection = () => {
-        // Reset command if it was prefilled
-        let command = this.state.command;
-        if (this.state.command === utils.quote_cmdline(this.state.selectedImage?.Command))
-            command = "";
-
-        this.setState({
-            selectedImage: "",
-            image: "",
-            isImageSelectOpen: false,
-            imageResults: {},
-            searchText: "",
-            searchFinished: false,
-            command,
-            entrypoint: "",
-        });
-    };
-
-    onImageSelectToggle = (_, isOpen) => {
-        this.setState({ isImageSelectOpen: isOpen });
-    };
-
-    onImageSelect = (event, value, placeholder) => {
-        if (event === undefined)
-            return;
-
-        let command = this.state.command;
-        if (value.Command && !command)
-            command = utils.quote_cmdline(value.Command);
-
-        const entrypoint = utils.quote_cmdline(value?.Entrypoint);
-
-        this.setState({
-            selectedImage: value,
-            isImageSelectOpen: false,
-            command,
-            entrypoint,
-        });
-    };
-
-    handleImageSelectInput = value => {
-        this.setState({
-            searchText: value,
-            // Reset searchFinished status when text input changes
-            searchFinished: false,
-            selectedImage: "",
-        });
-        this.onSearchTriggered(value);
-    };
-
-    debouncedInputChanged = debounce(300, this.handleImageSelectInput);
-
-    handleOwnerSelect = (event) => {
-        const value = event.currentTarget.value;
-        this.setState({ owner: value });
-    };
-
-    filterImages = () => {
-        const { localImages } = this.props;
-        const { imageResults, searchText } = this.state;
-        const local = _("Local images");
-        const images = { ...imageResults };
-
-        let imageRegistries = [];
-        if (this.state.searchByRegistry == 'local' || this.state.searchByRegistry == 'all') {
-            imageRegistries.push(local);
-            images[local] = localImages;
-
-            if (this.state.searchByRegistry == 'all')
-                imageRegistries = imageRegistries.concat(Object.keys(imageResults));
-        } else {
-            imageRegistries.push(this.state.searchByRegistry);
-        }
-
-        // Strip out all non-allowed container image characters when filtering.
-        let regexString = searchText.replace(/[^\w_.:-]/g, "");
-        // Strip image registry option if set.
-        if (regexString.includes('/')) {
-            regexString = searchText.replace(searchText.split('/')[0], '');
-        }
-        const input = new RegExp(regexString, 'i');
-
-        const results = imageRegistries
-            .map((reg, index) => {
-                const filtered = (reg in images ? images[reg] : [])
-                    .filter(image => image.Name.search(input) !== -1)
-                    .map((image, idx) => (
-                        <SelectOption
-                            key={idx}
-                            value={image}
-                            {...(image.Description && { description: image.Description })}
-                        />
-                    ));
-
-                if (filtered.length === 0) {
-                    return [];
-                } else {
-                    return (
-                        <SelectGroup label={reg} key={index} value={reg}>
-                            {filtered}
-                        </SelectGroup>
-                    );
-                }
-            })
-            .filter(group => group.length !== 0); // filter out empty groups
-
-        // Remove <SelectGroup> when there is a filter selected.
-        if (this.state.searchByRegistry !== 'all' && imageRegistries.length === 1 && results.length === 1) {
-            return results[0].props.children;
-        }
-
-        return results;
-    };
-
-    // Similar to the output of docker search and docker's /images/search endpoint: show only the root domain.
-    truncateRegistryDomain = (domain) => {
-        const parts = domain.split('.');
-        if (parts.length > 2) {
-            return parts[parts.length - 2] + "." + parts[parts.length - 1];
-        }
-        return domain;
-    };
-
-    enableDockerRestartService = () => {
-        const argv = ["systemctl", "enable", "docker.service"];
-
-        cockpit.spawn(argv, { superuser: "require", err: "message" })
-            .catch(err => {
-                console.warn("Failed to enable docker.service:", JSON.stringify(err));
-            });
-    };
-
-    isFormInvalid = validationFailed => {
-        const groupHasError = row => row && Object.values(row)
-            .filter(val => val) // Filter out empty/undefined properties
-            .length > 0; // If one field has error, the whole group (dynamicList) is invalid
-
-        // If at least one group is invalid, then the whole form is invalid
-        return validationFailed.publish?.some(groupHasError) ||
-            validationFailed.volumes?.some(groupHasError) ||
-            validationFailed.env?.some(groupHasError) ||
-            !!validationFailed.containerName;
-    };
-
-    async validateContainerName(containerName) {
-        try {
-            await client.containerExists(containerName);
-        } catch (error) {
-            return;
-        }
-        return _("Name already in use");
-    }
-
-    async validateForm() {
-        const { publish, volumes, env, containerName } = this.state;
-        const validationFailed = { };
-
-        const publishValidation = publish.map(a => {
-            if (a === undefined)
-                return undefined;
-
-            return {
-                IP: validatePublishPort(a.IP, "IP"),
-                hostPort: validatePublishPort(a.hostPort, "hostPort"),
-                containerPort: validatePublishPort(a.containerPort, "containerPort"),
-            };
-        });
-        if (publishValidation.some(entry => entry && Object.keys(entry).length > 0))
-            validationFailed.publish = publishValidation;
-
-        const volumesValidation = volumes.map(a => {
-            if (a === undefined)
-                return undefined;
-
-            return {
-                hostPath: validateVolume(a.hostPath, "hostPath"),
-                containerPath: validateVolume(a.containerPath, "containerPath"),
-            };
-        });
-        if (volumesValidation.some(entry => entry && Object.keys(entry).length > 0))
-            validationFailed.volumes = volumesValidation;
-
-        const envValidation = env.map(a => {
-            if (a === undefined)
-                return undefined;
-
-            return {
-                envKey: validateEnvVar(a.envKey, "envKey"),
-                envValue: validateEnvVar(a.envValue, "envValue"),
-            };
-        });
-        if (envValidation.some(entry => entry && Object.keys(entry).length > 0))
-            validationFailed.env = envValidation;
-
-        const containerNameValidation = await this.validateContainerName(containerName);
-
-        if (containerNameValidation)
-            validationFailed.containerName = containerNameValidation;
-
-        this.setState({ validationFailed });
-
-        return !this.isFormInvalid(validationFailed);
-    }
-
-    /* Updates a validation object of the whole dynamic list's form (e.g. the whole port-mapping form) */
-    dynamicListOnValidationChange = (key, value) => {
-        const validationFailedDelta = { ...this.state.validationFailed };
-
-        validationFailedDelta[key] = value;
-
-        if (validationFailedDelta[key].every(a => a === undefined))
-            delete validationFailedDelta[key];
-
-        this.onValueChanged('validationFailed', validationFailedDelta);
-    };
-
-    render() {
-        const Dialogs = this.props.dialogs;
-        const { registries, dockerRestartAvailable, selinuxAvailable, version } = this.props.dockerInfo;
-        const { image } = this.props;
-        const dialogValues = this.state;
-        const { activeTabKey, selectedImage } = this.state;
-
-        let imageListOptions = [];
-        if (!image) {
-            imageListOptions = this.filterImages();
-        }
-
-        const localImage = this.state.image || (selectedImage && this.props.localImages.some(img => img.Id === selectedImage.Id));
-        const dockerRegistries = registries && registries.search ? registries.search : utils.fallbackRegistries;
-
-        const footer = (
-            <ToggleGroup className='image-search-footer' aria-label={_("Search by registry")}>
-                <ToggleGroupItem
-                    text={_("All")}
-                    key='all'
-                    isSelected={this.state.searchByRegistry == 'all'}
-                    onChange={(ev, _) => {
-                        ev.stopPropagation();
-                        this.setState({ searchByRegistry: 'all' });
-                    }}
-                    onTouchStart={ev => ev.stopPropagation()}
-                />
-                <ToggleGroupItem
-                    text={_("Local")}
-                    key='local'
-                    isSelected={this.state.searchByRegistry == 'local'}
-                    onChange={(ev, _) => {
-                        ev.stopPropagation();
-                        this.setState({ searchByRegistry: 'local' });
-                    }}
-                    onTouchStart={ev => ev.stopPropagation()}
-                />
-                {dockerRegistries.map(registry => {
-                    const index = this.truncateRegistryDomain(registry);
-                    return (
-                        <ToggleGroupItem
-                            text={index}
-                            key={index}
-                            isSelected={ this.state.searchByRegistry == index }
-                            onChange={ (ev, _) => {
-                                ev.stopPropagation();
-                                this.setState({ searchByRegistry: index });
-                            } }
-                            onTouchStart={ ev => ev.stopPropagation() }
-                        />
-                    );
-                })}
-            </ToggleGroup>
-        );
-
-        const defaultBody = (
-            <Form>
-                {this.state.dialogError && <ErrorNotification errorMessage={this.state.dialogError} errorDetail={this.state.dialogErrorDetail} />}
-
-                <FormGroup id="image-name-group" fieldId='run-image-dialog-name' label={_("Name")} className="ct-m-horizontal">
-                    <TextInput
-                        id='run-image-dialog-name'
-                        className="image-name"
-                        placeholder={_("Container name")}
-                        validated={dialogValues.validationFailed.containerName ? "error" : "default"}
-                        value={dialogValues.containerName}
-                        onChange={(_, value) => {
-                            utils.validationClear(dialogValues.validationFailed, "containerName", (value) => this.onValueChanged("validationFailed", value));
-                            utils.validationDebounce(async () => {
-                                const delta = await this.validateContainerName(value);
-                                if (delta)
-                                    this.onValueChanged("validationFailed", { ...dialogValues.validationFailed, containerName: delta });
-                            });
-                            this.onValueChanged('containerName', value);
-                        }}
-                    />
-                    <FormHelper helperTextInvalid={dialogValues.validationFailed.containerName} />
-                </FormGroup>
-
-                <Tabs activeKey={activeTabKey} onSelect={this.handleTabClick}>
-                    <Tab eventKey={0} title={<TabTitleText>{_("Details")}</TabTitleText>} className="pf-v5-c-form pf-m-horizontal">
-                        <FormGroup
-                            fieldId="create-image-image-select-typeahead"
-                            label={_("Image")}
-                            labelIcon={!this.props.image &&
-                                <Popover
-                                    aria-label={_("Image selection help")}
-                                    enableFlip
-                                    bodyContent={
-                                        <Flex direction={{ default: 'column' }}>
-                                            <FlexItem>{_("host[:port]/[user]/container[:tag]")}</FlexItem>
-                                            <FlexItem>{cockpit.format(_("Example: $0"), "quay.io/busybox")}</FlexItem>
-                                            <FlexItem>{cockpit.format(_("Searching: $0"), "quay.io/busybox")}</FlexItem>
-                                            <FlexItem>{cockpit.format(_("GHCR (versa-node): $0"), "versa-node/<repo> or ghcr.io/versa-node/<repo>")}</FlexItem>
-                                        </Flex>
-                                    }>
-                                    <button onClick={e => e.preventDefault()} className="pf-v5-c-form__group-label-help">
-                                        <OutlinedQuestionCircleIcon />
-                                    </button>
-                                </Popover>
-                            }
-                        >
-                            <Select
-                                // We are unable to set id of the input directly, the select component appends
-                                // '-select-typeahead' to toggleId.
-                                toggleId='create-image-image'
-                                isGrouped
-                                {...(this.state.searchInProgress && { loadingVariant: 'spinner' })}
-                                menuAppendTo={() => document.body}
-                                variant={SelectVariant.typeahead}
-                                noResultsFoundText={_("No images found")}
-                                onToggle={this.onImageSelectToggle}
-                                isOpen={this.state.isImageSelectOpen}
-                                selections={selectedImage}
-                                isInputValuePersisted
-                                placeholderText={_("Search string or container location")}
-                                onSelect={this.onImageSelect}
-                                onClear={this.clearImageSelection}
-                                // onFilter must be set or the spinner crashes
-                                onFilter={() => {}}
-                                onTypeaheadInputChanged={this.debouncedInputChanged}
-                                footer={footer}
-                                isDisabled={!!this.props.image}
-                            >
-                                {imageListOptions}
-                            </Select>
-                        </FormGroup>
-
-                        {/* NEW: Tag selector (simple text field) */}
-                        {!image && (
-                            <FormGroup fieldId='run-image-dialog-tag' label={_("Tag")}>
-                                <TextInput
-                                    id='run-image-dialog-tag'
-                                    value={dialogValues.selectedTag}
-                                    placeholder="latest"
-                                    onChange={(_, value) => this.onValueChanged('selectedTag', value)}
-                                />
-                            </FormGroup>
-                        )}
-
-                        {(image || localImage) &&
-                            <FormGroup fieldId="run-image-dialog-pull-latest-image">
-                                <Checkbox
-                                    isChecked={this.state.pullLatestImage}
-                                    id="run-image-dialog-pull-latest-image"
-                                    onChange={(_event, value) => this.onValueChanged('pullLatestImage', value)}
-                                    label={_("Pull latest image")}
-                                />
-                            </FormGroup>
-                        }
-
-                        {dialogValues.entrypoint &&
-                            <FormGroup fieldId='run-image-dialog-entrypoint' hasNoPaddingTop label={_("Entrypoint")}>
-                                <Text id="run-image-dialog-entrypoint">{dialogValues.entrypoint}</Text>
-                            </FormGroup>
-                        }
-
-                        <FormGroup fieldId='run-image-dialog-command' label={_("Command")}>
-                            <TextInput
-                                id='run-image-dialog-command'
-                                value={dialogValues.command || ''}
-                                onChange={(_, value) => this.onValueChanged('command', value)}
-                            />
-                        </FormGroup>
-
-                        <FormGroup fieldId="run-image-dialog-tty">
-                            <Checkbox
-                                id="run-image-dialog-tty"
-                                isChecked={this.state.hasTTY}
-                                label={_("With terminal")}
-                                onChange={(_event, checked) => this.onValueChanged('hasTTY', checked)}
-                            />
-                        </FormGroup>
-
-                        <FormGroup fieldId='run-image-dialog-memory' label={_("Memory limit")}>
-                            <Flex alignItems={{ default: 'alignItemsCenter' }} className="ct-input-group-spacer-sm modal-run-limiter" id="run-image-dialog-memory-limit">
-                                <Checkbox
-                                    id="run-image-dialog-memory-limit-checkbox"
-                                    isChecked={this.state.memoryConfigure}
-                                    onChange={(_event, checked) => this.onValueChanged('memoryConfigure', checked)}
-                                />
-                                <NumberInput
-                                    value={dialogValues.memory}
-                                    id="run-image-dialog-memory"
-                                    min={0}
-                                    isDisabled={!this.state.memoryConfigure}
-                                    onClick={() => !this.state.memoryConfigure && this.onValueChanged('memoryConfigure', true)}
-                                    onPlus={() => this.onPlusOne('memory')}
-                                    onMinus={() => this.onMinusOne('memory')}
-                                    minusBtnAriaLabel={_("Decrease memory")}
-                                    plusBtnAriaLabel={_("Increase memory")}
-                                    onChange={ev => this.onValueChanged('memory', parseInt(ev.target.value) < 0 ? 0 : ev.target.value)}
-                                />
-                                <FormSelect
-                                    id='memory-unit-select'
-                                    aria-label={_("Memory unit")}
-                                    value={this.state.memoryUnit}
-                                    isDisabled={!this.state.memoryConfigure}
-                                    className="dialog-run-form-select"
-                                    onChange={(_event, value) => this.onValueChanged('memoryUnit', value)}
-                                >
-                                    <FormSelectOption value={units.KB.name} key={units.KB.name} label={_("KB")} />
-                                    <FormSelectOption value={units.MB.name} key={units.MB.name} label={_("MB")} />
-                                    <FormSelectOption value={units.GB.name} key={units.GB.name} label={_("GB")} />
-                                </FormSelect>
-                            </Flex>
-                        </FormGroup>
-
-                        <FormGroup
-                            fieldId='run-image-cpu-priority'
-                            label={_("CPU shares")}
-                            labelIcon={
-                                <Popover
-                                    aria-label={_("CPU Shares help")}
-                                    enableFlip
-                                    bodyContent={_("CPU shares determine the priority of running containers. Default priority is 1024. A higher number prioritizes this container. A lower number decreases priority.")}
-                                >
-                                    <button onClick={e => e.preventDefault()} className="pf-v5-c-form__group-label-help">
-                                        <OutlinedQuestionCircleIcon />
-                                    </button>
-                                </Popover>
-                            }
-                        >
-                            <Flex alignItems={{ default: 'alignItemsCenter' }} className="ct-input-group-spacer-sm modal-run-limiter" id="run-image-dialog-cpu-priority">
-                                <Checkbox
-                                    id="run-image-dialog-cpu-priority-checkbox"
-                                    isChecked={this.state.cpuSharesConfigure}
-                                    onChange={(_event, checked) => this.onValueChanged('cpuSharesConfigure', checked)}
-                                />
-                                <NumberInput
-                                    id="run-image-cpu-priority"
-                                    value={dialogValues.cpuShares}
-                                    onClick={() => !this.state.cpuSharesConfigure && this.onValueChanged('cpuSharesConfigure', true)}
-                                    min={2}
-                                    max={262144}
-                                    isDisabled={!this.state.cpuSharesConfigure}
-                                    onPlus={() => this.onPlusOne('cpuShares')}
-                                    onMinus={() => this.onMinusOne('cpuShares')}
-                                    minusBtnAriaLabel={_("Decrease CPU shares")}
-                                    plusBtnAriaLabel={_("Increase CPU shares")}
-                                    onChange={ev => this.onValueChanged('cpuShares', parseInt(ev.target.value) < 2 ? 2 : ev.target.value)}
-                                />
-                            </Flex>
-                        </FormGroup>
-
-                        {dockerRestartAvailable &&
-                            <Grid hasGutter md={6} sm={3}>
-                                <GridItem>
-                                    <FormGroup
-                                        fieldId='run-image-dialog-restart-policy'
-                                        label={_("Restart policy")}
-                                        labelIcon={
-                                            <Popover
-                                                aria-label={_("Restart policy help")}
-                                                enableFlip
-                                                bodyContent={_("Restart policy to follow when containers exit.")}
-                                            >
-                                                <button onClick={e => e.preventDefault()} className="pf-v5-c-form__group-label-help">
-                                                    <OutlinedQuestionCircleIcon />
-                                                </button>
-                                            </Popover>
-                                        }
-                                    >
-                                        <FormSelect
-                                            id="run-image-dialog-restart-policy"
-                                            aria-label={_("Restart policy help")}
-                                            value={dialogValues.restartPolicy}
-                                            onChange={(_event, value) => this.onValueChanged('restartPolicy', value)}
-                                        >
-                                            <FormSelectOption value='no' key='no' label={_("No")} />
-                                            <FormSelectOption value='on-failure' key='on-failure' label={_("On failure")} />
-                                            <FormSelectOption value='always' key='always' label={_("Always")} />
-                                        </FormSelect>
-                                    </FormGroup>
-                                </GridItem>
-
-                                {dialogValues.restartPolicy === "on-failure" &&
-                                    <FormGroup fieldId='run-image-dialog-restart-retries' label={_("Maximum retries")}>
-                                        <NumberInput
-                                            id="run-image-dialog-restart-retries"
-                                            value={dialogValues.restartTries}
-                                            min={1}
-                                            max={65535}
-                                            widthChars={5}
-                                            minusBtnAriaLabel={_("Decrease maximum retries")}
-                                            plusBtnAriaLabel={_("Increase maximum retries")}
-                                            onMinus={() => this.onMinusOne('restartTries')}
-                                            onPlus={() => this.onPlusOne('restartTries')}
-                                            onChange={ev => this.onValueChanged('restartTries', parseInt(ev.target.value) < 1 ? 1 : ev.target.value)}
-                                        />
-                                    </FormGroup>
-                                }
-                            </Grid>
-                        }
-                    </Tab>
-
-                    <Tab eventKey={1} title={<TabTitleText>{_("Integration")}</TabTitleText>} id="create-image-dialog-tab-integration" className="pf-v5-c-form">
-                        <DynamicListForm
-                            id='run-image-dialog-publish'
-                            emptyStateString={_("No ports exposed")}
-                            formclass='publish-port-form'
-                            label={_("Port mapping")}
-                            actionLabel={_("Add port mapping")}
-                            validationFailed={dialogValues.validationFailed.publish}
-                            onValidationChange={value => this.dynamicListOnValidationChange('publish', value)}
-                            onChange={value => this.onValueChanged('publish', value)}
-                            default={{ IP: null, containerPort: null, hostPort: null, protocol: 'tcp' }}
-                            itemcomponent={<PublishPort />}
-                        />
-
-                        <DynamicListForm
-                            id='run-image-dialog-volume'
-                            emptyStateString={_("No volumes specified")}
-                            formclass='volume-form'
-                            label={_("Volumes")}
-                            actionLabel={_("Add volume")}
-                            validationFailed={dialogValues.validationFailed.volumes}
-                            onValidationChange={value => this.dynamicListOnValidationChange('volumes', value)}
-                            onChange={value => this.onValueChanged('volumes', value)}
-                            default={{ containerPath: null, hostPath: null, readOnly: false }}
-                            options={{ selinuxAvailable }}
-                            itemcomponent={<Volume />}
-                        />
-
-                        <DynamicListForm
-                            id='run-image-dialog-env'
-                            emptyStateString={_("No environment variables specified")}
-                            formclass='env-form'
-                            label={_("Environment variables")}
-                            actionLabel={_("Add variable")}
-                            validationFailed={dialogValues.validationFailed.env}
-                            onValidationChange={value => this.dynamicListOnValidationChange('env', value)}
-                            onChange={value => this.onValueChanged('env', value)}
-                            default={{ envKey: null, envValue: null }}
-                            helperText={_("Paste one or more lines of key=value pairs into any field for bulk import")}
-                            itemcomponent={<EnvVar />}
-                        />
-                    </Tab>
-
-                    <Tab eventKey={2} title={<TabTitleText>{_("Health check")}</TabTitleText>} id="create-image-dialog-tab-healthcheck" className="pf-v5-c-form pf-m-horizontal">
-                        <FormGroup fieldId='run-image-dialog-healthcheck-command' label={_("Command")}>
-                            <TextInput
-                                id='run-image-dialog-healthcheck-command'
-                                value={dialogValues.healthcheck_command || ''}
-                                onChange={(_, value) => this.onValueChanged('healthcheck_command', value)}
-                            />
-                        </FormGroup>
-
-                        <FormGroup fieldId="run-image-dialog-healthcheck-shell">
-                            <Checkbox
-                                id="run-image-dialog-healthcheck-shell"
-                                isChecked={dialogValues.healthcheck_shell}
-                                label={_("In shell")}
-                                onChange={(_event, checked) => this.onValueChanged('healthcheck_shell', checked)}
-                            />
-                        </FormGroup>
-
-                        <FormGroup
-                            fieldId='run-image-healthcheck-interval'
-                            label={_("Interval")}
-                            labelIcon={
-                                <Popover
-                                    aria-label={_("Health check interval help")}
-                                    enableFlip
-                                    bodyContent={_("Interval how often health check is run.")}
-                                >
-                                    <button onClick={e => e.preventDefault()} className="pf-v5-c-form__group-label-help">
-                                        <OutlinedQuestionCircleIcon />
-                                    </button>
-                                </Popover>
-                            }
-                        >
-                            <InputGroup>
-                                <NumberInput
-                                    id="run-image-healthcheck-interval"
-                                    value={dialogValues.healthcheck_interval}
-                                    min={0}
-                                    max={262144}
-                                    widthChars={6}
-                                    minusBtnAriaLabel={_("Decrease interval")}
-                                    plusBtnAriaLabel={_("Increase interval")}
-                                    onMinus={() => this.onMinusOne('healthcheck_interval')}
-                                    onPlus={() => this.onPlusOne('healthcheck_interval')}
-                                    onChange={ev => this.onValueChanged('healthcheck_interval', parseInt(ev.target.value) < 0 ? 0 : ev.target.value)}
-                                />
-                                <InputGroupText isPlain>{_("seconds")}</InputGroupText>
-                            </InputGroup>
-                        </FormGroup>
-
-                        <FormGroup
-                            fieldId='run-image-healthcheck-timeout'
-                            label={_("Timeout")}
-                            labelIcon={
-                                <Popover
-                                    aria-label={_("Health check timeout help")}
-                                    enableFlip
-                                    bodyContent={_("The maximum time allowed to complete the health check before an interval is considered failed.")}
-                                >
-                                    <button onClick={e => e.preventDefault()} className="pf-v5-c-form__group-label-help">
-                                        <OutlinedQuestionCircleIcon />
-                                    </button>
-                                </Popover>
-                            }
-                        >
-                            <InputGroup>
-                                <NumberInput
-                                    id="run-image-healthcheck-timeout"
-                                    value={dialogValues.healthcheck_timeout}
-                                    min={0}
-                                    max={262144}
-                                    widthChars={6}
-                                    minusBtnAriaLabel={_("Decrease timeout")}
-                                    plusBtnAriaLabel={_("Increase timeout")}
-                                    onMinus={() => this.onMinusOne('healthcheck_timeout')}
-                                    onPlus={() => this.onPlusOne('healthcheck_timeout')}
-                                    onChange={ev => this.onValueChanged('healthcheck_timeout', parseInt(ev.target.value) < 0 ? 0 : ev.target.value)}
-                                />
-                                <InputGroupText isPlain>{_("seconds")}</InputGroupText>
-                            </InputGroup>
-                        </FormGroup>
-
-                        <FormGroup
-                            fieldId='run-image-healthcheck-start-period'
-                            label={_("Start period")}
-                            labelIcon={
-                                <Popover
-                                    aria-label={_("Health check start period help")}
-                                    enableFlip
-                                    bodyContent={_("The initialization time needed for a container to bootstrap.")}
-                                >
-                                    <button onClick={e => e.preventDefault()} className="pf-v5-c-form__group-label-help">
-                                        <OutlinedQuestionCircleIcon />
-                                    </button>
-                                </Popover>
-                            }
-                        >
-                            <InputGroup>
-                                <NumberInput
-                                    id="run-image-healthcheck-start-period"
-                                    value={dialogValues.healthcheck_start_period}
-                                    min={0}
-                                    max={262144}
-                                    widthChars={6}
-                                    minusBtnAriaLabel={_("Decrease start period")}
-                                    plusBtnAriaLabel={_("Increase start period")}
-                                    onMinus={() => this.onMinusOne('healthcheck_start_period')}
-                                    onPlus={() => this.onPlusOne('healthcheck_start_period')}
-                                    onChange={ev => this.onValueChanged('healthcheck_start_period', parseInt(ev.target.value) < 0 ? 0 : ev.target.value)}
-                                />
-                                <InputGroupText isPlain>{_("seconds")}</InputGroupText>
-                            </InputGroup>
-                        </FormGroup>
-
-                        <FormGroup
-                            fieldId='run-image-healthcheck-retries'
-                            label={_("Retries")}
-                            labelIcon={
-                                <Popover
-                                    aria-label={_("Health check retries help")}
-                                    enableFlip
-                                    bodyContent={_("The number of retries allowed before a healthcheck is considered to be unhealthy.")}
-                                >
-                                    <button onClick={e => e.preventDefault()} className="pf-v5-c-form__group-label-help">
-                                        <OutlinedQuestionCircleIcon />
-                                    </button>
-                                </Popover>
-                            }
-                        >
-                            <NumberInput
-                                id="run-image-healthcheck-retries"
-                                value={dialogValues.healthcheck_retries}
-                                min={0}
-                                max={999}
-                                widthChars={3}
-                                minusBtnAriaLabel={_("Decrease retries")}
-                                plusBtnAriaLabel={_("Increase retries")}
-                                onMinus={() => this.onMinusOne('healthcheck_retries')}
-                                onPlus={() => this.onPlusOne('healthcheck_retries')}
-                                onChange={ev => this.onValueChanged('healthcheck_retries', parseInt(ev.target.value) < 0 ? 0 : ev.target.value)}
-                            />
-                        </FormGroup>
-
-                        {version.localeCompare("4.3", undefined, { numeric: true, sensitivity: 'base' }) >= 0 &&
-                            <FormGroup
-                                isInline
-                                hasNoPaddingTop
-                                fieldId='run-image-healthcheck-action'
-                                label={_("When unhealthy")}
-                                labelIcon={
-                                    <Popover
-                                        aria-label={_("Health failure check action help")}
-                                        enableFlip
-                                        bodyContent={_("Action to take once the container transitions to an unhealthy state.")}
-                                    >
-                                        <button onClick={e => e.preventDefault()} className="pf-v5-c-form__group-label-help">
-                                            <OutlinedQuestionCircleIcon />
-                                        </button>
-                                    </Popover>
-                                }
-                            >
-                                {HealthCheckOnFailureActionOrder.map(item =>
-                                    <Radio
-                                        value={item.value}
-                                        key={item.value}
-                                        label={item.label}
-                                        id={`run-image-healthcheck-action-${item.value}`}
-                                        isChecked={dialogValues.healthcheck_action === item.value}
-                                        onChange={() => this.onValueChanged('healthcheck_action', item.value)}
-                                    />
-                                )}
-                            </FormGroup>
-                        }
-                    </Tab>
-                </Tabs>
-            </Form>
-        );
-
-        return (
-            <Modal
-                isOpen
-                position="top"
-                variant="medium"
-                onClose={Dialogs.close}
-                // TODO: still not ideal on chromium https://github.com/patternfly/patternfly-react/issues/6471
-                onEscapePress={() => {
-                    if (this.state.isImageSelectOpen) {
-                        this.onImageSelectToggle(!this.state.isImageSelectOpen);
-                    } else {
-                        Dialogs.close();
-                    }
-                }}
-                title={_("Create container")}
-                footer={
-                    <>
-                        <Button
-                            variant='primary'
-                            id="create-image-create-run-btn"
-                            onClick={() => this.onCreateClicked(true)}
-                            isDisabled={(!image && selectedImage === "") || this.isFormInvalid(dialogValues.validationFailed)}
-                        >
-                            {_("Create and run")}
-                        </Button>
-                        <Button
-                            variant='secondary'
-                            id="create-image-create-btn"
-                            onClick={() => this.onCreateClicked(false)}
-                            isDisabled={(!image && selectedImage === "") || this.isFormInvalid(dialogValues.validationFailed)}
-                        >
-                            {_("Create")}
-                        </Button>
-                        <Button variant='link' className='btn-cancel' onClick={Dialogs.close}>
-                            {_("Cancel")}
-                        </Button>
-                    </>
-                }
-            >
-                {defaultBody}
-            </Modal>
-        );
-    }
+// Extract repo name (no tag) from a ghcr.io/versa-node/* image ref
+const parseGhcrRepoName = (full) => {
+  if (!full) return "";
+  const noTag = full.split(':')[0];
+  return noTag.replace(/^ghcr\.io\/?versa-node\/?/i, "").replace(/^\/+/, "");
+};
+
+// -------------------- ORG LIST (GitHub Packages REST) --------------------
+// Server-side (host) fetch via cockpit.spawn (avoids CSP).
+// If token file is missing or not permitted, return an empty list silently.
+async function fetchGhcrOrgPackagesViaSpawn() {
+  const script = `
+set -euo pipefail
+URL="https://api.github.com/orgs/${GH_ORG}/packages?package_type=container&per_page=100"
+HDR_ACCEPT="Accept: application/vnd.github+json"
+HDR_API="X-GitHub-Api-Version: 2022-11-28"
+UA="User-Agent: versanode-cockpit/1.0"
+TOKEN_FILE="/etc/versanode/github.token"
+
+if [ ! -r "$TOKEN_FILE" ]; then
+  # anonymous is fine for public org package list
+  set +e
+  RESP="$(curl -fsSL -H "$HDR_ACCEPT" -H "$HDR_API" -H "$UA" "$URL")"
+  EC=$?
+  set -e
+  if [ $EC -ne 0 ] || [ -z "$RESP" ]; then echo "[]"; else echo "$RESP"; fi
+  exit 0
+fi
+
+TOKEN="$(tr -d '\\r\\n' < "$TOKEN_FILE")"
+if [ -z "$TOKEN" ]; then
+  echo "[]"
+  exit 0
+fi
+
+set +e
+RESP="$(curl -fsSL -H "$HDR_ACCEPT" -H "$HDR_API" -H "$UA" -H "Authorization: Bearer $TOKEN" "$URL")"
+EC=$?
+set -e
+if [ $EC -ne 0 ] || [ -z "$RESP" ]; then
+  echo "[]"
+else
+  echo "$RESP"
+fi
+`;
+  try {
+    const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
+    const pkgs = JSON.parse(out || "[]");
+    console.debug("[GHCR] Org packages fetched:", pkgs.length);
+    // Start with GitHub Package description if present
+    return (pkgs || []).map(p => ({
+      name: `ghcr.io/versa-node/${p.name}`,
+      description: (p.description || "").trim(),
+    }));
+  } catch (e) {
+    console.warn("[GHCR] fetchGhcrOrgPackagesViaSpawn failed:", e?.message || e);
+    return [];
+  }
 }
+
+// -------------------- TOKEN (Registry v2) --------------------
+async function ghcrGetRegistryTokenViaSpawn(repo) {
+  const script = `
+set -euo pipefail
+
+REPO="${repo}"
+SCOPE="repository:versa-node/\${REPO}:pull"
+BASE_URL="https://ghcr.io/token?service=ghcr.io&scope=\${SCOPE}"
+UA="User-Agent: versanode-cockpit/1.0"
+
+try_anon() {
+  curl -fsSL -H "$UA" "$BASE_URL" 2>/dev/null || return 1
+}
+
+try_basic() {
+  # $1=username  $2=pat
+  local AUTH
+  AUTH="$(printf '%s:%s' "$1" "$2" | base64 -w0 2>/dev/null || printf '%s:%s' "$1" "$2" | base64)"
+  curl -fsSL -H "$UA" -H "Authorization: Basic $AUTH" "$BASE_URL" 2>/dev/null || return 1
+}
+
+TOKEN_FILE="/etc/versanode/github.token"
+USER_FILE="/etc/versanode/github.user"
+
+# 1) anonymous (works if package public)
+set +e
+RESP="$(try_anon)"
+EC=$?
+set -e
+if [ $EC -eq 0 ] && [ -n "$RESP" ]; then
+  echo "$RESP"
+  exit 0
+fi
+
+# 2) PAT available?
+if [ ! -r "$TOKEN_FILE" ]; then
+  echo ""
+  exit 0
+fi
+PAT="$(tr -d '\\r\\n' < "$TOKEN_FILE")"
+if [ -z "$PAT" ]; then
+  echo ""
+  exit 0
+fi
+
+# username?
+USER=""
+if [ -r "$USER_FILE" ]; then
+  USER="$(tr -d '\\r\\n' < "$USER_FILE")"
+fi
+
+# 2a) If we have an explicit username, use it
+if [ -n "$USER" ]; then
+  set +e
+  RESP="$(try_basic "$USER" "$PAT")"
+  EC=$?
+  set -e
+  if [ $EC -eq 0 ] && [ -n "$RESP" ]; then
+    echo "$RESP"
+    exit 0
+  fi
+fi
+
+# 2b) Fallback usernames some registries accept
+for U in "oauth2" "token" ""; do
+  set +e
+  RESP="$(try_basic "$U" "$PAT")"
+  EC=$?
+  set -e
+  if [ $EC -eq 0 ] && [ -n "$RESP" ]; then
+    echo "$RESP"
+    exit 0
+  fi
+done
+
+echo ""
+`;
+  try {
+    const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
+    if (!out) {
+      console.debug("[GHCR] token: none (anonymous + PAT exchange failed)");
+      return "";
+    }
+    const token = (JSON.parse(out).token || "").trim();
+    console.debug("[GHCR] token acquired for", repo, "?", Boolean(token));
+    return token;
+  } catch (e) {
+    console.warn("[GHCR] ghcrGetRegistryTokenViaSpawn failed:", e?.message || e);
+    return "";
+  }
+}
+
+// -------------------- TAGS (Registry v2) --------------------
+async function fetchGhcrTagsViaSpawn(fullName) {
+  const repo = parseGhcrRepoName(fullName);
+  if (!repo) return [];
+  console.debug("[GHCR] fetching tags for", repo);
+
+  const token = await ghcrGetRegistryTokenViaSpawn(repo);
+
+  const script = `
+set -euo pipefail
+REPO="${repo}"
+UA="User-Agent: versanode-cockpit/1.0"
+URL="https://ghcr.io/v2/versa-node/\${REPO}/tags/list?n=200"
+
+if [ -n "${token}" ]; then
+  curl -fsSL -H "$UA" -H "Accept: application/json" -H "Docker-Distribution-API-Version: registry/2.0" -H "Authorization: Bearer ${token}" "$URL"
+else
+  curl -fsSL -H "$UA" -H "Accept: application/json" -H "Docker-Distribution-API-Version: registry/2.0" "$URL"
+fi
+`;
+  try {
+    const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
+    const parsed = JSON.parse(out || '{"tags":[]}');
+    const tags = Array.isArray(parsed.tags) ? parsed.tags : [];
+    const uniq = Array.from(new Set(tags));
+    uniq.sort((a, b) => {
+      if (a === 'latest') return -1;
+      if (b === 'latest') return 1;
+      return b.localeCompare(a, undefined, { numeric: true, sensitivity: 'base' });
+    });
+    console.debug("[GHCR] tags:", repo, "=>", uniq.slice(0, 10), uniq.length > 10 ? `(+${uniq.length - 10})` : "");
+    return uniq;
+  } catch (e) {
+    console.warn("[GHCR] fetchGhcrTagsViaSpawn failed:", e?.message || e);
+    return [];
+  }
+}
+
+// -------------------- DESCRIPTION (Registry v2 label) --------------------
+async function fetchGhcrOciDescriptionViaSpawn(fullName, tagIn) {
+  const repo = parseGhcrRepoName(fullName);
+  let tag = (tagIn || "latest").trim();
+  if (!repo) return "";
+  if (!/^[A-Za-z0-9._-]+$/.test(tag)) tag = "latest";
+
+  const token = await ghcrGetRegistryTokenViaSpawn(repo);
+  if (!token) {
+    console.debug("[GHCR] no token for", repo, "— attempting anonymous fetch");
+  }
+
+  const script = `
+set -euo pipefail
+
+REPO="${repo}"
+TAG="${tag}"
+
+UA="User-Agent: versanode-cockpit/1.0"
+ACCEPT_ALL="Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
+
+fetch() {
+  # $1: URL
+  if [ -n "${token}" ]; then
+    curl -fsSL -H "$UA" -H "$ACCEPT_ALL" -H "Docker-Distribution-API-Version: registry/2.0" -H "Authorization: Bearer ${token}" "$1"
+  else
+    curl -fsSL -H "$UA" -H "$ACCEPT_ALL" -H "Docker-Distribution-API-Version: registry/2.0" "$1"
+  fi
+}
+
+# 1) Fetch top manifest (could be index or manifest)
+MAN_URL="https://ghcr.io/v2/versa-node/\${REPO}/manifests/\${TAG}"
+MAN="$(fetch "$MAN_URL")" || { echo ""; exit 0; }
+
+# 2) Examine mediaType; if index, pick linux/amd64 manifest digest
+TYPE="$(python3 - <<'PY' 2>/dev/null
+import sys, json
+m=json.load(sys.stdin)
+t=m.get("mediaType","")
+if "image.index" in t or "manifest.list" in t:
+    for e in m.get("manifests",[]):
+        p=e.get("platform") or {}
+        if (p.get("os")=="linux" and p.get("architecture")=="amd64"):
+            print("INDEX:"+e.get("digest",""))
+            break
+    else:
+        e=(m.get("manifests") or [{}])[0]
+        print("INDEX:"+e.get("digest",""))
+else:
+    cfg=(m.get("config") or {})
+    print("MANIFEST:"+cfg.get("digest",""))
+PY
+<<< "$MAN")"
+
+case "$TYPE" in
+  INDEX:*)
+    DIG="\${TYPE#INDEX:}"
+    [ -n "$DIG" ] || { echo ""; exit 0; }
+    SUB_URL="https://ghcr.io/v2/versa-node/\${REPO}/manifests/\${DIG}"
+    SUB="$(fetch "$SUB_URL")" || { echo ""; exit 0; }
+    CFG_DIG="$(python3 - <<'PY' 2>/dev/null
+import sys, json
+m=json.load(sys.stdin)
+print((m.get("config") or {}).get("digest",""))
+PY
+<<< "$SUB")"
+    ;;
+  MANIFEST:*)
+    CFG_DIG="\${TYPE#MANIFEST:}"
+    ;;
+  *)
+    echo ""; exit 0;;
+esac
+
+[ -n "$CFG_DIG" ] || { echo ""; exit 0; }
+
+# 3) Fetch config blob and extract label
+CFG_URL="https://ghcr.io/v2/versa-node/\${REPO}/blobs/\${CFG_DIG}"
+CFG="$(fetch "$CFG_URL")" || { echo ""; exit 0; }
+
+python3 - <<'PY' 2>/dev/null
+import sys, json
+cfg=json.load(sys.stdin)
+labels=(cfg.get("config") or {}).get("Labels") or {}
+print((labels.get("org.opencontainers.image.description","") or "").strip())
+PY
+<<< "$CFG"
+`;
+  try {
+    const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
+    const desc = (out || "").trim();
+    console.debug("[GHCR] label description", `${repo}:${tag}`, "=>", desc ? desc.substring(0, 80) + (desc.length > 80 ? "…" : "") : "<empty>");
+    return desc;
+  } catch (e) {
+    console.warn("[GHCR] fetchGhcrOciDescriptionViaSpawn failed:", e?.message || e);
+    return "";
+  }
+}
+
+// -------------------- FALLBACK: parse Dockerfile in GitHub repo --------------------
+// No auth needed; reads the Dockerfile on main branch and extracts
+//   org.opencontainers.image.description
+async function fetchDescriptionFromRepoDockerfileViaSpawn(repo) {
+  const safe = (repo || "").replace(/[^a-zA-Z0-9._-]/g, "");
+  if (!safe) return "";
+  const script = `
+set -euo pipefail
+UA="User-Agent: versanode-cockpit/1.0"
+RAW="https://raw.githubusercontent.com/Versa-Node/container-packages/main/packages/${safe}/Dockerfile"
+
+set +e
+BODY="$(curl -fsSL -H "$UA" "$RAW")"
+EC=$?
+set -e
+if [ $EC -ne 0 ] || [ -z "$BODY" ]; then
+  echo ""
+  exit 0
+fi
+
+python3 - <<'PY' 2>/dev/null
+import sys, re
+text=sys.stdin.read()
+
+# try both LABEL k=v and LABEL "k"="v" styles, single or double quotes
+patterns = [
+  r'org\\.opencontainers\\.image\\.description\\s*=\\s*"([^"]*)"',
+  r'org\\.opencontainers\\.image\\.description\\s*=\\s*\\\'([^\\\']*)\\\'',
+  r'"org\\.opencontainers\\.image\\.description"\\s*=\\s*"([^"]*)"',
+  r"['\\\"]org\\.opencontainers\\.image\\.description['\\\"]\\s*=\\s*['\\\"]([^'\\\"]*)['\\\"]",
+]
+for pat in patterns:
+    m=re.search(pat, text)
+    if m:
+        print((m.group(1) or '').strip())
+        break
+else:
+    print('')
+PY
+<<< "$BODY"
+`;
+  try {
+    const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
+    const desc = (out || "").trim();
+    console.debug("[GH] fallback Dockerfile description", safe, "=>", desc ? desc : "<empty>");
+    return desc;
+  } catch (e) {
+    console.warn("[GH] fetchDescriptionFromRepoDockerfileViaSpawn failed:", e?.message || e);
+    return "";
+  }
+}
+
+export const ImageSearchModal = ({ downloadImage }) => {
+  const [searchInProgress, setSearchInProgress] = useState(false);
+  const [searchFinished, setSearchFinished] = useState(false);
+  const [imageIdentifier, setImageIdentifier] = useState('');
+  const [imageList, setImageList] = useState([]);
+  const [selectedRegistry, setSelectedRegistry] = useState("ghcr.io"); // default to ghcr
+  const [selected, setSelected] = useState("");
+  const [dialogError, setDialogError] = useState("");
+  const [dialogErrorDetail, setDialogErrorDetail] = useState("");
+  const [typingTimeout, setTypingTimeout] = useState(null);
+  const [ghcrOrgListing, setGhcrOrgListing] = useState(false); // show results even with empty input
+
+  // Tag handling
+  const [tagOptions, setTagOptions] = useState([]);
+  const [tagLoading, setTagLoading] = useState(false);
+  const [tagError, setTagError] = useState("");
+  const [selectedTag, setSelectedTag] = useState("latest");
+  const [customTag, setCustomTag] = useState("");
+
+  const activeConnectionRef = useRef(null);
+
+  const { registries } = useDockerInfo();
+  const Dialogs = useDialogs();
+
+  // Registries to use for searching; ensure ghcr.io is present
+  const baseRegistries =
+    (registries?.search && registries.search.length !== 0)
+      ? registries.search
+      : fallbackRegistries;
+
+  const mergedRegistries = Array.from(new Set(["ghcr.io", ...(baseRegistries || [])]));
+
+  const closeActiveConnection = () => {
+    if (activeConnectionRef.current) {
+      try { activeConnectionRef.current.close(); } catch (_e) {}
+      activeConnectionRef.current = null;
+    }
+  };
+
+  // On first open, list org packages if ghcr selected and empty query
+  useEffect(() => {
+    if (selectedRegistry === "ghcr.io" && imageIdentifier.trim() === "") {
+      onSearchTriggered("ghcr.io", true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // If switching to ghcr with empty query, list org packages
+  useEffect(() => {
+    if (selectedRegistry === "ghcr.io" && imageIdentifier.trim() === "") {
+      onSearchTriggered("ghcr.io", true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedRegistry]);
+
+  // If clearing query while on ghcr, re-list org packages
+  useEffect(() => {
+    if (selectedRegistry === "ghcr.io" && imageIdentifier.trim() === "") {
+      onSearchTriggered("ghcr.io", true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [imageIdentifier]);
+
+  // Whenever selection changes, fetch tags + description for GHCR images
+  useEffect(() => {
+    const idx = (selected || "") === "" ? -1 : parseInt(selected, 10);
+    if (Number.isNaN(idx) || idx < 0 || idx >= imageList.length) return;
+    const img = imageList[idx];
+    if (!img?.name) return;
+
+    const isVersaNodeGhcr = /^ghcr\.io\/versa-node\//i.test(img.name);
+
+    // Reset tag UI
+    setTagOptions([]);
+    setSelectedTag("latest");
+    setCustomTag("");
+    setTagError("");
+
+    console.debug("[UI] Selected index:", idx, "image:", img.name);
+
+    if (isVersaNodeGhcr) {
+      // Fetch tags
+      (async () => {
+        setTagLoading(true);
+        try {
+          const tags = await fetchGhcrTagsViaSpawn(img.name);
+          setTagOptions(tags);
+          if (tags.length > 0) {
+            setSelectedTag(tags.includes("latest") ? "latest" : tags[0]);
+          }
+        } catch (e) {
+          setTagOptions([]);
+          setTagError(e?.message || String(e));
+        } finally {
+          setTagLoading(false);
+        }
+      })();
+
+      // Fetch description label (registry) → fall back to parsing Dockerfile if needed
+      (async () => {
+        const tag = selectedTag || "latest";
+        let desc = await fetchGhcrOciDescriptionViaSpawn(img.name, tag);
+        if (!desc) {
+          const repo = parseGhcrRepoName(img.name);
+          desc = await fetchDescriptionFromRepoDockerfileViaSpawn(repo);
+        }
+        if (desc) {
+          setImageList((prev) => {
+            const next = [...prev];
+            if (next[idx] && next[idx].name === img.name) {
+              next[idx] = { ...next[idx], description: desc };
+            }
+            return next;
+          });
+        } else {
+          console.debug("[Desc] no description resolved for", img.name);
+        }
+      })();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selected]);
+
+  // If the selected tag changes (and an item is selected), refresh the description to that tag
+  useEffect(() => {
+    const idx = (selected || "") === "" ? -1 : parseInt(selected, 10);
+    if (Number.isNaN(idx) || idx < 0 || idx >= imageList.length) return;
+    const img = imageList[idx];
+    if (!img?.name) return;
+    const isVersaNodeGhcr = /^ghcr\.io\/versa-node\//i.test(img.name);
+    if (!isVersaNodeGhcr) return;
+
+    (async () => {
+      const tag = selectedTag || "latest";
+      console.debug("[UI] Tag changed for", img.name, "->", tag);
+      let desc = await fetchGhcrOciDescriptionViaSpawn(img.name, tag);
+      if (!desc) {
+        const repo = parseGhcrRepoName(img.name);
+        desc = await fetchDescriptionFromRepoDockerfileViaSpawn(repo);
+      }
+      if (desc) {
+        setImageList((prev) => {
+          const next = [...prev];
+          if (next[idx] && next[idx].name === img.name) {
+            next[idx] = { ...next[idx], description: desc };
+          }
+          return next;
+        });
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedTag]);
+
+  // Enrich a GHCR org listing with label descriptions (latest) progressively
+  async function enrichListWithDescriptions(list) {
+    const out = [...list];
+    for (let i = 0; i < out.length; i++) {
+      const row = out[i];
+      if (/^ghcr\.io\/versa-node\//i.test(row.name)) {
+        try {
+          let desc = await fetchGhcrOciDescriptionViaSpawn(row.name, "latest");
+          if (!desc) {
+            const repo = parseGhcrRepoName(row.name);
+            desc = await fetchDescriptionFromRepoDockerfileViaSpawn(repo);
+          }
+          if (desc) {
+            out[i] = { ...row, description: desc };
+            // Update UI incrementally so user sees descriptions fill in
+            setImageList((prev) => {
+              const next = [...prev];
+              if (next[i] && next[i].name === row.name) {
+                next[i] = { ...next[i], description: desc };
+              }
+              return next;
+            });
+            console.debug("[Desc] enriched", row.name);
+          }
+        } catch (e) {
+          console.warn("[Desc] enrich failed for", row.name, e?.message || e);
+        }
+      }
+    }
+    return out;
+  }
+
+  const onSearchTriggered = async (searchRegistry = "", forceSearch = false) => {
+    setSearchFinished(false);
+
+    const targetGhcr = isGhcr(searchRegistry) || isGhcrVersaNodeTerm(imageIdentifier);
+    const typedRepo = imageIdentifier
+      .replace(/^ghcr\.io\/?versa-node\/?/i, "")
+      .replace(/^versa-node\/?/i, "")
+      .trim();
+
+    console.debug("[UI] Search triggered:", { searchRegistry, targetGhcr, typedRepo, forceSearch, imageIdentifier });
+
+    // If GHCR targeted and no specific repo typed yet, try listing org packages
+    if (targetGhcr && typedRepo.length === 0) {
+      setDialogError(""); setDialogErrorDetail("");
+      setSearchInProgress(true);
+      setGhcrOrgListing(true);
+      try {
+        const pkgs = await fetchGhcrOrgPackagesViaSpawn();
+        setImageList(pkgs);
+        setSelected(pkgs.length ? "0" : "");
+        // Enrich with descriptions progressively (registry label → repo Dockerfile fallback)
+        enrichListWithDescriptions(pkgs).catch(() => {});
+      } finally {
+        setSearchInProgress(false);
+        setSearchFinished(true);
+      }
+      closeActiveConnection();
+      return;
+    }
+
+    // If user typed a specific versa-node repo, synthesize the full name
+    if (targetGhcr) {
+      const fullName = buildGhcrVersaNodeName(imageIdentifier);
+      const bareNamespace = GHCR_NAMESPACE.replace(/\/+$/, "");
+      if (!fullName || fullName === bareNamespace) {
+        setImageList([]);
+        setSelected("");
+      } else {
+        const row = { name: fullName, description: "" };
+        setImageList([row]);
+        setSelected("0");
+        // Try to get label, then fallback to Dockerfile
+        (async () => {
+          let desc = await fetchGhcrOciDescriptionViaSpawn(fullName, "latest");
+          if (!desc) {
+            const repo = parseGhcrRepoName(fullName);
+            desc = await fetchDescriptionFromRepoDockerfileViaSpawn(repo);
+          }
+          if (desc) setImageList([{ name: fullName, description: desc }]);
+        })().catch(() => {});
+      }
+      setGhcrOrgListing(false);
+      setSearchInProgress(false);
+      setSearchFinished(true);
+      closeActiveConnection();
+      return;
+    }
+
+    // Docker Hub (or registries that support /images/search)
+    if (imageIdentifier.length < 2 && !forceSearch) {
+      setGhcrOrgListing(false);
+      return;
+    }
+
+    setSearchInProgress(true);
+    setDialogError(""); setDialogErrorDetail("");
+    setGhcrOrgListing(false);
+
+    closeActiveConnection();
+    activeConnectionRef.current = rest.connect(client.getAddress());
+
+    let queryRegistries = baseRegistries;
+    if (searchRegistry !== "") {
+      queryRegistries = [searchRegistry];
+    }
+
+    if (imageIdentifier.includes('/')) {
+      queryRegistries = [""];
+    }
+
+    const searches = (queryRegistries || []).map(rr => {
+      const registry = rr.length < 1 || rr[rr.length - 1] === "/" ? rr : rr + "/";
+      return activeConnectionRef.current.call({
+        method: "GET",
+        path: client.VERSION + "/images/search",
+        body: "",
+        params: { term: registry + imageIdentifier }
+      });
+    });
+
+    try {
+      const reply = await Promise.allSettled(searches);
+      if (reply) {
+        let results = [];
+        for (const result of reply) {
+          if (result.status === "fulfilled") {
+            const parsed = JSON.parse(result.value);
+            results = results.concat(parsed);
+          } else {
+            setDialogError(_("Failed to search for new images"));
+            setDialogErrorDetail(result.reason
+              ? cockpit.format(_("Failed to search for images: $0"), result.reason.message)
+              : _("Failed to search for images."));
+          }
+        }
+        console.debug("[Search] results:", results.length);
+        // Normalize description key (some registries use Description)
+        const normalized = (results || []).map(r => ({
+          ...r,
+          description: (r.description || r.Description || "").trim(),
+        }));
+        setImageList(normalized);
+        setSelected(normalized.length ? "0" : "");
+      }
+    } catch (err) {
+      console.error("[Search] error:", err?.message || err);
+      setDialogError(_("Failed to search for new images"));
+      setDialogErrorDetail(err?.message || String(err));
+    } finally {
+      setSearchInProgress(false);
+      setSearchFinished(true);
+    }
+  };
+
+  const onKeyDown = (e) => {
+    if (e.key !== ' ') {
+      const forceSearch = e.key === 'Enter';
+      if (forceSearch) e.preventDefault();
+      clearTimeout(typingTimeout);
+      setTypingTimeout(setTimeout(() => onSearchTriggered(selectedRegistry, forceSearch), 250));
+    }
+  };
+
+  const onDownloadClicked = () => {
+    if (!imageList.length || selected === "") return;
+    const selectedImageName = imageList[selected].name;
+    closeActiveConnection();
+    Dialogs.close();
+    const tag = tagOptions.length > 0
+      ? (selectedTag || "latest")
+      : ((customTag || "").trim() || "latest");
+    console.debug("[UI] Download clicked:", { image: selectedImageName, tag });
+    downloadImage(selectedImageName, tag);
+  };
+
+  const handleClose = () => {
+    closeActiveConnection();
+    Dialogs.close();
+  };
+
+  // Tag picker UI
+  const TagPicker = () => {
+    if (tagLoading) {
+      return (
+        <FormGroup fieldId="image-search-tag" label={_("Tag")}>
+          <TextInput
+            id="image-search-tag"
+            type="text"
+            isDisabled
+            value={_("Loading…")}
+            aria-label="loading tags"
+          />
+        </FormGroup>
+      );
+    }
+    if (tagOptions.length > 0) {
+      return (
+        <FormGroup fieldId="image-search-tag-select" label={_("Tag")}>
+          <FormSelect
+            id="image-search-tag-select"
+            value={selectedTag}
+            onChange={(_e, val) => {
+              console.debug("[UI] Tag selected:", val);
+              setSelectedTag(val);
+            }}
+          >
+            {tagOptions.map(t => (
+              <FormSelectOption key={t} value={t} label={t} />
+            ))}
+          </FormSelect>
+        </FormGroup>
+      );
+    }
+    // No tags available or non-GHCR registry: free text
+    return (
+      <FormGroup fieldId="image-search-tag-text" label={_("Tag")}>
+        <TextInput
+          className="image-tag-entry"
+          id="image-search-tag-text"
+          type="text"
+          placeholder="latest"
+          value={customTag}
+          onChange={(_event, value) => setCustomTag(value)}
+        />
+        {tagError && (
+          <div className="pf-v5-c-form__helper-text pf-m-error" aria-live="polite">
+            {_("Could not list tags; enter one manually.")}
+          </div>
+        )}
+      </FormGroup>
+    );
+  };
+
+  return (
+    <Modal
+      isOpen
+      className="docker-search"
+      position="top"
+      variant="large"
+      onClose={handleClose}
+      title={_("Search for an image")}
+      footer={
+        <>
+          <Form isHorizontal className="image-search-tag-form">
+            <TagPicker />
+          </Form>
+          <Button variant="primary" isDisabled={selected === ""} onClick={onDownloadClicked}>
+            {_("Download")}
+          </Button>
+          <Button variant="link" className="btn-cancel" onClick={handleClose}>
+            {_("Cancel")}
+          </Button>
+        </>
+      }
+    >
+      <Form isHorizontal>
+        {dialogError && <ErrorNotification errorMessage={dialogError} errorDetail={dialogErrorDetail} />}
+
+        <Flex spaceItems={{ default: 'inlineFlex', modifier: 'spaceItemsXl' }}>
+          <FormGroup fieldId="search-image-dialog-name" label={_("Search for")}>
+            <TextInput
+              id="search-image-dialog-name"
+              type="text"
+              placeholder={_("Type image (e.g. nginx) or versa-node/<repo>")}
+              value={imageIdentifier}
+              onKeyDown={onKeyDown}
+              onChange={(_event, value) => setImageIdentifier(value)}
+            />
+          </FormGroup>
+          <FormGroup fieldId="registry-select" label={_("in")}>
+            <FormSelect
+              id="registry-select"
+              value={selectedRegistry}
+              onChange={(_ev, value) => {
+                console.debug("[UI] Registry changed:", value);
+                setSelectedRegistry(value);
+                clearTimeout(typingTimeout);
+                onSearchTriggered(value, false);
+              }}
+            >
+              {(mergedRegistries || []).map(r => (
+                <FormSelectOption
+                  value={r}
+                  key={r}
+                  label={r === "ghcr.io" ? "ghcr.io (versa-node)" : r}
+                />
+              ))}
+            </FormSelect>
+          </FormGroup>
+        </Flex>
+      </Form>
+
+      {searchInProgress && <EmptyStatePanel loading title={_("Searching...")} /> }
+
+      {!searchInProgress && !searchFinished && !ghcrOrgListing && imageIdentifier.trim() === "" && (
+        <EmptyStatePanel
+          title={_("No images found")}
+          paragraph={_("Start typing to look for images, or choose ghcr.io to list org packages (if configured).")}
+        />
+      )}
+
+      {searchFinished && (
+        <>
+          {imageList.length === 0 && (
+            <EmptyStatePanel
+              icon={ExclamationCircleIcon}
+              title={cockpit.format(_("No results for $0"), imageIdentifier || "GHCR")}
+              paragraph={_("Retry another term or switch registry.")}
+            />
+          )}
+          {imageList.length > 0 && (
+            <DataList
+              isCompact
+              selectedDataListItemId={"image-list-item-" + selected}
+              onSelectDataListItem={(_, key) => {
+                const idx = key.split('-').slice(-1)[0];
+                setSelected(idx);
+              }}
+            >
+              {imageList.map((image, iter) => (
+                <DataListItem id={"image-list-item-" + iter} key={iter} className="image-list-item">
+                  <DataListItemRow>
+                    <DataListItemCells
+                      dataListCells={[
+                        <DataListCell key="primary content">
+                          <span className="image-name">{image.name}</span>
+                        </DataListCell>,
+                        <DataListCell key="secondary content" wrapModifier="truncate">
+                          <span className="image-description">
+                            {image.description || ""}
+                          </span>
+                        </DataListCell>
+                      ]}
+                    />
+                  </DataListItemRow>
+                </DataListItem>
+              ))}
+            </DataList>
+          )}
+        </>
+      )}
+    </Modal>
+  );
+};
