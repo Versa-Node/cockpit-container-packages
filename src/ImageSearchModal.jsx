@@ -20,10 +20,11 @@ import './ImageSearchModal.css';
 
 const _ = cockpit.gettext;
 
-// ---------- GHCR helpers (only versa-node) ----------
-const GH_ORG = "versa-node"; // org is case-insensitive in API paths
+/* ============================================================================
+   GHCR helpers (only versa-node)
+   ---------------------------------------------------------------------------- */
+const GH_ORG = "versa-node";              // org is case-insensitive in API paths
 const GHCR_NAMESPACE = "ghcr.io/versa-node/";
-const PLACEHOLDER_DESC = "(loading description…)";
 
 const isGhcr = (reg) => (reg || "").trim().toLowerCase() === "ghcr.io";
 
@@ -39,15 +40,20 @@ const buildGhcrVersaNodeName = (txt) => {
   return (GHCR_NAMESPACE + t).replace(/\/+$/, "");
 };
 
-// Extract repo name (no tag) from a ghcr.io/versa-node/* image ref
+// repo name (no tag) from a ghcr.io/versa-node/* image ref
 const parseGhcrRepoName = (full) => {
   if (!full) return "";
   const noTag = full.split(':')[0];
   return noTag.replace(/^ghcr\.io\/?versa-node\/?/i, "").replace(/^\/+/, "");
 };
 
-// Server-side (host) fetch via cockpit.spawn (avoids CSP).
-// If token file is missing or not permitted, return an empty list silently.
+// Since we embed values into a bash script, keep them ultra-safe.
+const safeRef = (s) => (s || "").replace(/[^A-Za-z0-9._-]/g, "");
+
+/* ----------------------------------------------------------------------------
+   Server-side (host) fetch via cockpit.spawn (avoids CSP).
+   If token file is missing or not permitted, return an empty list silently.
+---------------------------------------------------------------------------- */
 async function fetchGhcrOrgPackagesViaSpawn() {
   const script = `
 set -euo pipefail
@@ -82,7 +88,7 @@ fi
     const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
     const pkgs = JSON.parse(out || "[]");
     console.debug("[GHCR] Org packages fetched:", pkgs.length);
-    // Start with GH package description if present; we'll try to enrich with OCI label later.
+    // Start with GitHub Package description (we will try to enrich with OCI label later)
     return (pkgs || []).map(p => ({
       name: `ghcr.io/versa-node/${p.name}`,
       description: (p.description || "").trim(),
@@ -93,22 +99,22 @@ fi
   }
 }
 
-/**
- * Acquire a short-lived GHCR registry token (JWT) for the given repo.
- * Strategy:
- *  1) Try anonymous (works for public packages).
- *  2) If /etc/versanode/github.token exists, optionally read username from
- *     /etc/versanode/github.user (recommended). Exchange via Basic auth.
- *  3) Fall back to a couple of safe Basic variants if username unknown.
- * The function NEVER logs the token itself.
- */
-async function ghcrGetRegistryTokenViaSpawn(repo) {
+/* ----------------------------------------------------------------------------
+   Acquire a short-lived GHCR registry token (JWT) for a repo (versa-node/<repo>).
+   Strategy:
+     1) Try anonymous token for scope repository:versa-node/<repo>:pull
+     2) If /etc/versanode/github.token exists, optionally read username from
+        /etc/versanode/github.user and exchange via Basic auth.
+   NOTE: We never log the token itself.
+---------------------------------------------------------------------------- */
+async function ghcrGetRegistryTokenViaSpawn(repoIn) {
+  const repo = safeRef(repoIn);
   const script = `
 set -euo pipefail
 
 REPO="${repo}"
-SCOPE="repository:versa-node/\${REPO}:pull"
-BASE_URL="https://ghcr.io/token?service=ghcr.io&scope=\${SCOPE}"
+SCOPE="repository:versa-node/${repo}:pull"
+BASE_URL="https://ghcr.io/token?service=ghcr.io&scope=${"$"}{SCOPE}"
 UA="User-Agent: versanode-cockpit/1.0"
 
 try_anon() {
@@ -141,10 +147,7 @@ if [ ! -r "$TOKEN_FILE" ]; then
   exit 0
 fi
 PAT="$(tr -d '\\r\\n' < "$TOKEN_FILE")"
-if [ -z "$PAT" ]; then
-  echo ""
-  exit 0
-fi
+[ -z "$PAT" ] && { echo ""; exit 0; }
 
 # username?
 USER=""
@@ -182,7 +185,7 @@ echo ""
   try {
     const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
     if (!out) {
-      console.debug("[GHCR] token: none (anonymous + PAT exchange failed)");
+      console.debug("[GHCR] token exchange: no response");
       return "";
     }
     const token = (JSON.parse(out).token || "").trim();
@@ -194,22 +197,25 @@ echo ""
   }
 }
 
-// Fetch tags from GHCR Registry V2 API (no docker pull needed).
+/* ----------------------------------------------------------------------------
+   Fetch tags from GHCR Registry V2 API (no docker pull needed).
+---------------------------------------------------------------------------- */
 async function fetchGhcrTagsViaSpawn(fullName) {
   const repo = parseGhcrRepoName(fullName);
   if (!repo) return [];
   console.debug("[GHCR] fetching tags for", repo);
 
   const token = await ghcrGetRegistryTokenViaSpawn(repo);
+  const TOKEN = token.replace(/"/g, '\\"'); // very conservative quoting
 
   const script = `
 set -euo pipefail
-REPO="${repo}"
+REPO="${safeRef(repo)}"
 UA="User-Agent: versanode-cockpit/1.0"
-URL="https://ghcr.io/v2/versa-node/\${REPO}/tags/list?n=200"
+URL="https://ghcr.io/v2/versa-node/${safeRef(repo)}/tags/list?n=200"
 
-if [ -n "${token}" ]; then
-  curl -fsSL -H "$UA" -H "Accept: application/json" -H "Docker-Distribution-API-Version: registry/2.0" -H "Authorization: Bearer ${token}" "$URL"
+if [ -n "${TOKEN}" ]; then
+  curl -fsSL -H "$UA" -H "Accept: application/json" -H "Docker-Distribution-API-Version: registry/2.0" -H "Authorization: Bearer ${TOKEN}" "$URL"
 else
   curl -fsSL -H "$UA" -H "Accept: application/json" -H "Docker-Distribution-API-Version: registry/2.0" "$URL"
 fi
@@ -232,8 +238,11 @@ fi
   }
 }
 
-// Fetch org.opencontainers.image.description from the OCI/Docker config for a repo:tag
-// Uses registry token; does NOT require pulling the image locally.
+/* ----------------------------------------------------------------------------
+   Fetch org.opencontainers.image.description from the OCI/Docker config for a
+   repo:tag (follows index -> linux/amd64 manifest -> config blob).
+   Uses GHCR token above; does NOT require pulling to local docker.
+---------------------------------------------------------------------------- */
 async function fetchGhcrOciDescriptionViaSpawn(fullName, tagIn) {
   const repo = parseGhcrRepoName(fullName);
   let tag = (tagIn || "latest").trim();
@@ -242,34 +251,33 @@ async function fetchGhcrOciDescriptionViaSpawn(fullName, tagIn) {
 
   const token = await ghcrGetRegistryTokenViaSpawn(repo);
   if (!token) {
-    console.debug("[GHCR] no token for", repo, "— will not attempt label fetch");
+    console.debug("[GHCR] no token for", repo, "— will try anonymous fetch");
   }
+  const TOKEN = token.replace(/"/g, '\\"'); // conservative quoting
 
   const script = `
 set -euo pipefail
 
-REPO="${repo}"
-TAG="${tag}"
+REPO="${safeRef(repo)}"
+TAG="${safeRef(tag)}"
 
 UA="User-Agent: versanode-cockpit/1.0"
 ACCEPT_ALL="Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
-AUTH_H=""
-if [ -n "${token}" ]; then AUTH_H="-H Authorization: Bearer ${token}"; fi
 
 fetch() {
   # $1: URL
-  if [ -n "${token}" ]; then
-    curl -fsSL -H "$UA" -H "$ACCEPT_ALL" -H "Docker-Distribution-API-Version: registry/2.0" -H "Authorization: Bearer ${token}" "$1"
+  if [ -n "${TOKEN}" ]; then
+    curl -fsSL -H "$UA" -H "$ACCEPT_ALL" -H "Docker-Distribution-API-Version: registry/2.0" -H "Authorization: Bearer ${TOKEN}" "$1"
   else
     curl -fsSL -H "$UA" -H "$ACCEPT_ALL" -H "Docker-Distribution-API-Version: registry/2.0" "$1"
   fi
 }
 
-# 1) Fetch top manifest (could be index or manifest)
-MAN_URL="https://ghcr.io/v2/versa-node/\${REPO}/manifests/\${TAG}"
+# 1) Top manifest (could be index or single manifest)
+MAN_URL="https://ghcr.io/v2/versa-node/${safeRef(repo)}/manifests/${safeRef(tag)}"
 MAN="$(fetch "$MAN_URL")" || { echo ""; exit 0; }
 
-# 2) Examine mediaType; if index, pick linux/amd64 manifest digest
+# 2) Determine whether it's an index; if so pick linux/amd64 manifest
 TYPE="$(python3 - <<'PY' 2>/dev/null
 import sys, json
 m=json.load(sys.stdin)
@@ -293,7 +301,7 @@ case "$TYPE" in
   INDEX:*)
     DIG="\${TYPE#INDEX:}"
     [ -n "$DIG" ] || { echo ""; exit 0; }
-    SUB_URL="https://ghcr.io/v2/versa-node/\${REPO}/manifests/\${DIG}"
+    SUB_URL="https://ghcr.io/v2/versa-node/${safeRef(repo)}/manifests/\${DIG}"
     SUB="$(fetch "$SUB_URL")" || { echo ""; exit 0; }
     CFG_DIG="$(python3 - <<'PY' 2>/dev/null
 import sys, json
@@ -312,7 +320,7 @@ esac
 [ -n "$CFG_DIG" ] || { echo ""; exit 0; }
 
 # 3) Fetch config blob and extract label
-CFG_URL="https://ghcr.io/v2/versa-node/\${REPO}/blobs/\${CFG_DIG}"
+CFG_URL="https://ghcr.io/v2/versa-node/${safeRef(repo)}/blobs/\${CFG_DIG}"
 CFG="$(fetch "$CFG_URL")" || { echo ""; exit 0; }
 
 python3 - <<'PY' 2>/dev/null
@@ -334,6 +342,9 @@ PY
   }
 }
 
+/* ============================================================================
+   Component
+============================================================================ */
 export const ImageSearchModal = ({ downloadImage }) => {
   const [searchInProgress, setSearchInProgress] = useState(false);
   const [searchFinished, setSearchFinished] = useState(false);
@@ -445,8 +456,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
             return next;
           });
         } else {
-          // Keep whatever GitHub Package description we already had (or blank)
-          console.debug("[GHCR] No OCI description for", img.name, "— leaving GH package description");
+          console.debug("[GHCR] No OCI description for", img.name, "— leaving GitHub package description");
         }
       })();
     }
@@ -525,15 +535,10 @@ export const ImageSearchModal = ({ downloadImage }) => {
       setGhcrOrgListing(true);
       try {
         const pkgs = await fetchGhcrOrgPackagesViaSpawn();
-        // Seed with placeholder so the column isn't blank; will be enriched
-        const seeded = pkgs.map(p => ({
-          ...p,
-          description: p.description || "", // use GH package description if present
-        }));
-        setImageList(seeded);
-        setSelected(seeded.length ? "0" : "");
+        setImageList(pkgs);
+        setSelected(pkgs.length ? "0" : "");
         // Enrich with image label descriptions (latest), progressively
-        enrichListWithOciDescriptions(seeded).catch(() => {});
+        enrichListWithOciDescriptions(pkgs).catch(() => {});
       } finally {
         setSearchInProgress(false);
         setSearchFinished(true);
@@ -550,7 +555,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
         setImageList([]);
         setSelected("");
       } else {
-        // Start with GH pkg description empty; then try OCI label
+        // Start with GitHub pkg description empty; then try OCI label
         const row = { name: fullName, description: "" };
         setImageList([row]);
         setSelected("0");
@@ -659,7 +664,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
     Dialogs.close();
   };
 
-  // Tag picker UI: show a combobox (FormSelect) when we have tagOptions; else free text input.
+  // Tag picker UI: combobox when tagOptions present; else free text input.
   const TagPicker = () => {
     if (tagLoading) {
       return (
