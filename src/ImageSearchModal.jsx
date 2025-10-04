@@ -156,6 +156,7 @@ async function fetchGhcrTagsViaSpawn(fullName) {
   if (!repo) return [];
 
   const token = await ghcrGetRegistryTokenViaSpawn(repo);
+  console.log("URL IS", "https://ghcr.io/v2/versa-node/\${repo}/tags/list?n=200");
   const script = `
 set -euo pipefail
 REPO="${repo}"
@@ -164,7 +165,7 @@ AUTH="${token ? `Authorization: Bearer ${'${TOKEN}'}"` : ""}"
 TOKEN="${token || ""}"
 
 URL="https://ghcr.io/v2/versa-node/\${REPO}/tags/list?n=200"
-console.log("URL IS", "https://ghcr.io/v2/versa-node/\${REPO}/tags/list?n=200");
+
 
 if [ -n "$TOKEN" ]; then
   curl -fsSL -H "$UA" -H "Accept: application/json" -H "Authorization: Bearer $TOKEN" "$URL"
