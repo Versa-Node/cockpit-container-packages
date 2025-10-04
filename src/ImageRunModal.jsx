@@ -50,15 +50,35 @@ const HealthCheckOnFailureActionOrder = [
     { value: 2, label: _("Force stop") },
 ];
 
-// ---- GHCR helpers (versanode) ----
-const GHCR_NAMESPACE = "ghcr.io/versanode/";
-const isGhcrVersanodeTerm = (term) =>
-  /^ghcr\.io\/versanode\/[^/]+/i.test(term || "") || /^versanode\/[^/]+/i.test(term || "");
-const buildGhcrVersanodeName = (txt) => {
-  const t = (txt || "").trim()
-    .replace(/^ghcr\.io\/?/i, "")
-    .replace(/^versanode\/?/i, "");
-  return (GHCR_NAMESPACE + t).replace(/\/+$/, "");
+// ---- GHCR helpers (versa-node) ----
+// Primary org (normalized output)
+const GHCR_PRIMARY_ORG = "versa-node";
+const GHCR_NAMESPACE = `ghcr.io/${GHCR_PRIMARY_ORG}/`;
+
+// Accept either "versa-node" or legacy "versanode" when the user types
+const GHCR_ORG_ALIASES = ["versa-node", "versanode"];
+
+// Is the typed term clearly pointing to our GHCR space?
+const isGhcrVersaNodeTerm = (term) => {
+    const t = (term || "").trim().toLowerCase();
+    const aliasGroup = GHCR_ORG_ALIASES.join("|"); // "versa-node|versanode"
+    return new RegExp(`^ghcr\\.io/(${aliasGroup})/[^/]+`).test(t)
+        || new RegExp(`^(${aliasGroup})/[^/]+`).test(t);
+};
+
+// Normalize whatever the user typed into "ghcr.io/versa-node/<name>[:tag]"
+const buildGhcrVersaNodeName = (txt) => {
+    let t = (txt || "").trim();
+
+    // strip leading ghcr.io/
+    t = t.replace(/^ghcr\.io\/?/i, "");
+
+    // strip any alias org prefix (versa-node or versanode)
+    const aliasGroup = GHCR_ORG_ALIASES.join("|");
+    t = t.replace(new RegExp(`^(${aliasGroup})\/?`, "i"), "");
+
+    // ensure single trailing slash after namespace, no double slashes
+    return (GHCR_NAMESPACE + t).replace(/\/+$/, "");
 };
 
 export class ImageRunModal extends React.Component {
@@ -355,13 +375,13 @@ export class ImageRunModal extends React.Component {
             return;
         }
 
-        // GHCR (versanode) synthetic result if footer toggled to ghcr.io or user typed versanode/...
+        // GHCR (versa-node) synthetic result if footer toggled to ghcr.io or user typed versa-node/...
         const selectedIndex = this.state.searchByRegistry; // 'all' | 'local' | 'docker.io' | 'ghcr.io'
-        const targetGhcr = selectedIndex === 'ghcr.io' || isGhcrVersanodeTerm(value);
+        const targetGhcr = selectedIndex === 'ghcr.io' || isGhcrVersaNodeTerm(value);
         if (targetGhcr) {
-            const name = buildGhcrVersanodeName(value);
+            const name = buildGhcrVersaNodeName(value);
             const images = name && name !== GHCR_NAMESPACE.replace(/\/+$/, "")
-                ? { "ghcr.io": [{ Name: name, Description: "GitHub Container Registry (versanode)" }] }
+                ? { "ghcr.io": [{ Name: name, Description: "GitHub Container Registry (versa-node)" }] }
                 : { "ghcr.io": [] };
 
             if (this.activeConnection)
@@ -374,7 +394,7 @@ export class ImageRunModal extends React.Component {
                 dialogError: "",
                 dialogErrorDetail: "",
             });
-            return; // do not call /images/search for GHCR
+            return; // do not call /images/search for GHCR synthetic
         }
 
         if (this.activeConnection)
@@ -774,7 +794,7 @@ export class ImageRunModal extends React.Component {
                                             <FlexItem>{_("host[:port]/[user]/container[:tag]")}</FlexItem>
                                             <FlexItem>{cockpit.format(_("Example: $0"), "quay.io/busybox")}</FlexItem>
                                             <FlexItem>{cockpit.format(_("Searching: $0"), "quay.io/busybox")}</FlexItem>
-                                            <FlexItem>{cockpit.format(_("GHCR (versanode): $0"), "versanode/<repo> or ghcr.io/versanode/<repo>")}</FlexItem>
+                                            <FlexItem>{cockpit.format(_("GHCR (versa-node): $0"), "versa-node/<repo> or ghcr.io/versa-node/<repo>")}</FlexItem>
                                         </Flex>
                                     }>
                                     <button onClick={e => e.preventDefault()} className="pf-v5-c-form__group-label-help">
