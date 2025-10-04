@@ -80,57 +80,13 @@ fi
   try {
     const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
     const pkgs = JSON.parse(out || "[]");
+    // Initial description from GH package metadata (will be enriched by OCI label later)
     return (pkgs || []).map(p => ({
       name: `ghcr.io/versa-node/${p.name}`,
-      description: p.description || "GitHub Container Registry (versa-node)",
+      description: p.description || "",
     }));
   } catch (_e) {
     return [];
-  }
-}
-
-// Fetch a single GHCR package’s description from GitHub Packages API
-async function fetchGhcrPackageDescriptionViaSpawn(packageName) {
-  const safe = packageName.replace(/[^a-zA-Z0-9._-]/g, "");
-  const script = `
-set -euo pipefail
-PKG="${safe}"
-URL="https://api.github.com/orgs/${GH_ORG}/packages/container/${safe}"
-HDR_ACCEPT="Accept: application/vnd.github+json"
-HDR_API="X-GitHub-Api-Version: 2022-11-28"
-HDR_UA="User-Agent: versanode-cockpit/1.0"
-TOKEN_FILE="/etc/versanode/github.token"
-
-maybe_echo_empty() { echo ""; }
-
-if [ ! -r "$TOKEN_FILE" ]; then
-  maybe_echo_empty; exit 0
-fi
-TOKEN="$(tr -d '\\r\\n' < "$TOKEN_FILE")"
-if [ -z "$TOKEN" ]; then
-  maybe_echo_empty; exit 0
-fi
-
-set +e
-RESP="$(curl -fsSL -H "$HDR_ACCEPT" -H "$HDR_API" -H "$HDR_UA" -H "Authorization: Bearer $TOKEN" "$URL")"
-EC=$?
-set -e
-if [ $EC -ne 0 ] || [ -z "$RESP" ]; then
-  maybe_echo_empty
-else
-  # pull just .description
-  python3 - <<'PY'
-import sys, json
-data=json.load(sys.stdin)
-print((data.get("description") or ""))
-PY
-fi
-`;
-  try {
-    const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message", input: "" });
-    return (out || "").trim();
-  } catch (_e) {
-    return "";
   }
 }
 
@@ -139,7 +95,6 @@ async function fetchGhcrTagsViaSpawn(fullName) {
   const repo = parseGhcrRepoName(fullName);
   if (!repo) return [];
 
-  // We try *without* token first (public). If it fails, we retry with token (if present).
   const script = `
 set -euo pipefail
 REPO="${repo}"
@@ -160,8 +115,6 @@ try_with_auth() {
   [ -z "$T" ] && return 1
   curl -fsSL -H "$1" -H "Authorization: Bearer $T" "$2" || return 1
 }
-
-HDR="Accept: application/json"
 
 set +e
 RESP="$(try_no_auth "$UA" "$BASE")"
@@ -185,8 +138,8 @@ fi
     const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
     const parsed = JSON.parse(out || '{"tags":[]}');
     const tags = Array.isArray(parsed.tags) ? parsed.tags : [];
-    // Put "latest" first if present, then others sorted desc by semver-ish name length fallback
     const uniq = Array.from(new Set(tags));
+    // Prefer "latest" first, then semver-ish/numeric
     uniq.sort((a, b) => {
       if (a === 'latest') return -1;
       if (b === 'latest') return 1;
@@ -195,6 +148,120 @@ fi
     return uniq;
   } catch (_e) {
     return [];
+  }
+}
+
+// Fetch org.opencontainers.image.description from the OCI/Docker config for a repo:tag
+// Works on multi-arch (follows manifest index -> linux/amd64 manifest -> config blob).
+async function fetchGhcrOciDescriptionViaSpawn(fullName, tagIn) {
+  const repo = parseGhcrRepoName(fullName);
+  let tag = (tagIn || "latest").trim();
+  if (!repo) return "";
+  // Keep only safe tag chars to avoid script injection
+  if (!/^[A-Za-z0-9._-]+$/.test(tag)) tag = "latest";
+
+  const script = `
+set -euo pipefail
+
+REPO="${repo}"
+TAG="${tag}"
+
+UA="User-Agent: versanode-cockpit/1.0"
+ACCEPT_ALL="Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
+
+token_header() {
+  local TOKEN_FILE="/etc/versanode/github.token"
+  if [ -r "$TOKEN_FILE" ]; then
+    local T
+    T="$(tr -d '\\r\\n' < "$TOKEN_FILE")"
+    if [ -n "$T" ]; then
+      echo "-H Authorization: Bearer $T"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+fetch() {
+  # $1: URL
+  local AUTH_ARGS=()
+  if ! curl -fsSL -H "$UA" -H "$ACCEPT_ALL" "$1"; then
+    if token_header >/dev/null; then
+      local TH; TH="$(token_header)"
+      # shellcheck disable=SC2086
+      curl -fsSL -H "$UA" -H "$ACCEPT_ALL" $TH "$1" || return 1
+    else
+      return 1
+    fi
+  fi
+}
+
+# 1) Fetch top manifest (could be index or manifest)
+MAN_URL="https://ghcr.io/v2/versa-node/${REPO}/manifests/${TAG}"
+MAN="$(fetch "$MAN_URL")" || { echo ""; exit 0; }
+
+# 2) Examine mediaType; if index, pick linux/amd64 manifest digest
+TYPE="$(python3 - <<'PY' 2>/dev/null
+import sys, json
+m=json.load(sys.stdin)
+t=m.get("mediaType","")
+if "image.index" in t or "manifest.list" in t:
+    # choose linux/amd64
+    for e in m.get("manifests",[]):
+        p=e.get("platform") or {}
+        if (p.get("os")=="linux" and p.get("architecture")=="amd64"):
+            print("INDEX:"+e.get("digest",""))
+            break
+    else:
+        # fallback first entry
+        e=(m.get("manifests") or [{}])[0]
+        print("INDEX:"+e.get("digest",""))
+else:
+    # schema2 manifest
+    cfg=(m.get("config") or {})
+    print("MANIFEST:"+cfg.get("digest",""))
+PY
+<<< "$MAN")"
+
+case "$TYPE" in
+  INDEX:*)
+    DIG="${TYPE#INDEX:}"
+    [ -n "$DIG" ] || { echo ""; exit 0; }
+    SUB_URL="https://ghcr.io/v2/versa-node/${REPO}/manifests/${DIG}"
+    SUB="$(fetch "$SUB_URL")" || { echo ""; exit 0; }
+    CFG_DIG="$(python3 - <<'PY' 2>/dev/null
+import sys, json
+m=json.load(sys.stdin)
+print((m.get("config") or {}).get("digest",""))
+PY
+<<< "$SUB")"
+    ;;
+  MANIFEST:*)
+    CFG_DIG="${TYPE#MANIFEST:}"
+    ;;
+  *)
+    echo ""; exit 0;;
+esac
+
+[ -n "$CFG_DIG" ] || { echo ""; exit 0; }
+
+# 3) Fetch config blob and extract label
+CFG_URL="https://ghcr.io/v2/versa-node/${REPO}/blobs/${CFG_DIG}"
+CFG="$(fetch "$CFG_URL")" || { echo ""; exit 0; }
+
+python3 - <<'PY' 2>/dev/null
+import sys, json
+cfg=json.load(sys.stdin)
+labels=(cfg.get("config") or {}).get("Labels") or {}
+print(labels.get("org.opencontainers.image.description",""))
+PY
+<<< "$CFG"
+`;
+  try {
+    const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
+    return (out || "").trim();
+  } catch (_e) {
+    return "";
   }
 }
 
@@ -261,7 +328,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [imageIdentifier]);
 
-  // Whenever selection changes, fetch tags/description for GHCR images
+  // Whenever selection changes, fetch tags + label description for GHCR images
   useEffect(() => {
     const idx = (selected || "") === "" ? -1 : parseInt(selected, 10);
     if (Number.isNaN(idx) || idx < 0 || idx >= imageList.length) return;
@@ -269,6 +336,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
     if (!img?.name) return;
 
     const isVersaNodeGhcr = /^ghcr\.io\/versa-node\//i.test(img.name);
+
     // Reset tag UI
     setTagOptions([]);
     setSelectedTag("latest");
@@ -282,7 +350,6 @@ export const ImageSearchModal = ({ downloadImage }) => {
         try {
           const tags = await fetchGhcrTagsViaSpawn(img.name);
           setTagOptions(tags);
-          // Keep "latest" if present, otherwise use first available tag
           if (tags.length > 0) {
             setSelectedTag(tags.includes("latest") ? "latest" : tags[0]);
           }
@@ -294,26 +361,71 @@ export const ImageSearchModal = ({ downloadImage }) => {
         }
       })();
 
-      // If description is generic, try to enrich from Packages API
-      if (!img.description || /GitHub Container Registry \(versa-node\)/i.test(img.description)) {
-        (async () => {
-          const repo = parseGhcrRepoName(img.name);
-          if (!repo) return;
-          const desc = await fetchGhcrPackageDescriptionViaSpawn(repo);
-          if (desc) {
-            setImageList((prev) => {
-              const next = [...prev];
-              if (next[idx] && next[idx].name === img.name) {
-                next[idx] = { ...next[idx], description: desc };
-              }
-              return next;
-            });
-          }
-        })();
-      }
+      // Fetch description label for the chosen/default tag and update that row
+      (async () => {
+        const tag = selectedTag || "latest";
+        const desc = await fetchGhcrOciDescriptionViaSpawn(img.name, tag);
+        if (desc) {
+          setImageList((prev) => {
+            const next = [...prev];
+            if (next[idx] && next[idx].name === img.name) {
+              next[idx] = { ...next[idx], description: desc };
+            }
+            return next;
+          });
+        }
+      })();
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected]);
+
+  // If the selected tag changes (and an item is selected), refresh the description to that tag
+  useEffect(() => {
+    const idx = (selected || "") === "" ? -1 : parseInt(selected, 10);
+    if (Number.isNaN(idx) || idx < 0 || idx >= imageList.length) return;
+    const img = imageList[idx];
+    if (!img?.name) return;
+    const isVersaNodeGhcr = /^ghcr\.io\/versa-node\//i.test(img.name);
+    if (!isVersaNodeGhcr) return;
+
+    (async () => {
+      const tag = selectedTag || "latest";
+      const desc = await fetchGhcrOciDescriptionViaSpawn(img.name, tag);
+      if (desc) {
+        setImageList((prev) => {
+          const next = [...prev];
+          if (next[idx] && next[idx].name === img.name) {
+            next[idx] = { ...next[idx], description: desc };
+          }
+          return next;
+        });
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedTag]);
+
+  // Enrich a GHCR org listing with label descriptions (latest) progressively
+  async function enrichListWithOciDescriptions(list) {
+    const out = [...list];
+    for (let i = 0; i < out.length; i++) {
+      const row = out[i];
+      if (/^ghcr\.io\/versa-node\//i.test(row.name)) {
+        const desc = await fetchGhcrOciDescriptionViaSpawn(row.name, "latest");
+        if (desc) {
+          out[i] = { ...row, description: desc };
+          // Update UI incrementally so user sees descriptions fill in
+          setImageList((prev) => {
+            const next = [...prev];
+            if (next[i] && next[i].name === row.name) {
+              next[i] = { ...next[i], description: desc };
+            }
+            return next;
+          });
+        }
+      }
+    }
+    return out;
+  }
 
   const onSearchTriggered = async (searchRegistry = "", forceSearch = false) => {
     setSearchFinished(false);
@@ -333,6 +445,8 @@ export const ImageSearchModal = ({ downloadImage }) => {
         const pkgs = await fetchGhcrOrgPackagesViaSpawn();
         setImageList(pkgs);
         setSelected(pkgs.length ? "0" : "");
+        // Enrich with image label descriptions (latest), progressively
+        enrichListWithOciDescriptions(pkgs).catch(() => {});
       } finally {
         setSearchInProgress(false);
         setSearchFinished(true);
@@ -349,8 +463,14 @@ export const ImageSearchModal = ({ downloadImage }) => {
         setImageList([]);
         setSelected("");
       } else {
-        setImageList([{ name: fullName, description: _("GitHub Container Registry (versa-node)") }]);
+        // Start with generic, then enrich from OCI label
+        const row = { name: fullName, description: "" };
+        setImageList([row]);
         setSelected("0");
+        // Try to get label from 'latest' immediately
+        fetchGhcrOciDescriptionViaSpawn(fullName, "latest").then(desc => {
+          if (desc) setImageList([{ name: fullName, description: desc }]);
+        }).catch(() => {});
       }
       setGhcrOrgListing(false);
       setSearchInProgress(false);
@@ -483,7 +603,6 @@ export const ImageSearchModal = ({ downloadImage }) => {
           value={customTag}
           onChange={(_event, value) => setCustomTag(value)}
         />
-        {/* Optional inline note on errors */}
         {tagError && (
           <div className="pf-v5-c-form__helper-text pf-m-error" aria-live="polite">
             {_("Could not list tags; enter one manually.")}
