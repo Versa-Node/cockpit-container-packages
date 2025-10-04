@@ -51,34 +51,14 @@ const HealthCheckOnFailureActionOrder = [
 ];
 
 // ---- GHCR helpers (versa-node) ----
-// Primary org (normalized output)
-const GHCR_PRIMARY_ORG = "versa-node";
-const GHCR_NAMESPACE = `ghcr.io/${GHCR_PRIMARY_ORG}/`;
-
-// Accept either "versa-node" or legacy "versanode" when the user types
-const GHCR_ORG_ALIASES = ["versa-node", "versanode"];
-
-// Is the typed term clearly pointing to our GHCR space?
-const isGhcrVersaNodeTerm = (term) => {
-    const t = (term || "").trim().toLowerCase();
-    const aliasGroup = GHCR_ORG_ALIASES.join("|"); // "versa-node|versanode"
-    return new RegExp(`^ghcr\\.io/(${aliasGroup})/[^/]+`).test(t)
-        || new RegExp(`^(${aliasGroup})/[^/]+`).test(t);
-};
-
-// Normalize whatever the user typed into "ghcr.io/versa-node/<name>[:tag]"
+const GHCR_NAMESPACE = "ghcr.io/versa-node/";
+const isGhcrVersaNodeTerm = (term) =>
+  /^ghcr\.io\/versa-node\/[^/]+/i.test(term || "") || /^versa-node\/[^/]+/i.test(term || "");
 const buildGhcrVersaNodeName = (txt) => {
-    let t = (txt || "").trim();
-
-    // strip leading ghcr.io/
-    t = t.replace(/^ghcr\.io\/?/i, "");
-
-    // strip any alias org prefix (versa-node or versanode)
-    const aliasGroup = GHCR_ORG_ALIASES.join("|");
-    t = t.replace(new RegExp(`^(${aliasGroup})\/?`, "i"), "");
-
-    // ensure single trailing slash after namespace, no double slashes
-    return (GHCR_NAMESPACE + t).replace(/\/+$/, "");
+  const t = (txt || "").trim()
+    .replace(/^ghcr\.io\/?/i, "")
+    .replace(/^versa-node\/?/i, "");
+  return (GHCR_NAMESPACE + t).replace(/\/+$/, "");
 };
 
 export class ImageRunModal extends React.Component {
@@ -188,7 +168,7 @@ export class ImageRunModal extends React.Component {
                 .forEach(item => {
                     ExposedPorts[item.containerPort + "/" + item.protocol] = {};
                     const mapping = { HostPort: item.hostPort };
-                    if (item.IP) // FIX: use item.IP (not item.hostIp)
+                    if (item.IP)
                         mapping.HostIp = item.IP;
                     PortBindings[item.containerPort + "/" + item.protocol] = [mapping];
                 });
@@ -259,8 +239,6 @@ export class ImageRunModal extends React.Component {
                     client.postContainer("start", reply.Id, {})
                         .then(() => Dialogs.close())
                         .catch(ex => {
-                            // If container failed to start remove it, so a user can fix the settings and retry and
-                            // won't get another error that the container name is already taken.
                             client.delContainer(reply.Id, true)
                                 .then(() => {
                                     this.setState({
@@ -308,7 +286,6 @@ export class ImageRunModal extends React.Component {
             Dialogs.close();
             const tempImage = { ...createConfig };
 
-            // Assign temporary properties to allow rendering
             tempImage.Id = tempImage.name;
             tempImage.State = { Status: _("downloading") };
             tempImage.Created = new Date();
@@ -358,24 +335,19 @@ export class ImageRunModal extends React.Component {
     }
 
     handleTabClick = (event, tabIndex) => {
-        // Prevent the form from being submitted.
         event.preventDefault();
         this.setState({ activeTabKey: tabIndex });
     };
 
     onSearchTriggered = value => {
-        // Do not call the SearchImage API if the input string is not at least 2 chars,
-        // The comparison was done considering the fact that we miss always one letter due to delayed setState
         if (value.length < 2)
             return;
 
-        // Don't search for a value with a tag specified
         const patt = /:[\w|\d]+$/;
         if (patt.test(value)) {
             return;
         }
 
-        // GHCR (versa-node) synthetic result if footer toggled to ghcr.io or user typed versa-node/...
         const selectedIndex = this.state.searchByRegistry; // 'all' | 'local' | 'docker.io' | 'ghcr.io'
         const targetGhcr = selectedIndex === 'ghcr.io' || isGhcrVersaNodeTerm(value);
         if (targetGhcr) {
@@ -394,7 +366,7 @@ export class ImageRunModal extends React.Component {
                 dialogError: "",
                 dialogErrorDetail: "",
             });
-            return; // do not call /images/search for GHCR synthetic
+            return;
         }
 
         if (this.activeConnection)
@@ -404,8 +376,6 @@ export class ImageRunModal extends React.Component {
         this.activeConnection = rest.connect(client.getAddress());
         let searches = [];
 
-        // If there are registries configured search in them, or if a user searches for `docker.io/cockpit` let
-        // docker search in the user specified registry.
         if (Object.keys(this.props.dockerInfo.registries).length !== 0 || value.includes('/')) {
             searches.push(this.activeConnection.call({
                 method: "GET",
@@ -435,16 +405,13 @@ export class ImageRunModal extends React.Component {
                             imageResults = imageResults.concat(JSON.parse(result.value));
                         } else {
                             dialogError = _("Failed to search for new images");
-                            // TODO: add registry context, docker does not include it in the reply.
                             dialogErrorDetail = result.reason
                                 ? cockpit.format(_("Failed to search for images: $0"), result.reason.message)
                                 : _("Failed to search for images.");
                         }
                     }
-                    // Group images on registry
                     const images = {};
                     imageResults.forEach(image => {
-                        // Add Tag if it's there
                         image.toString = function imageToString() {
                             if (this.Tag) {
                                 return this.Name + ':' + this.Tag;
@@ -453,9 +420,6 @@ export class ImageRunModal extends React.Component {
                         };
 
                         let index = image.Index;
-
-                        // listTags results do not return the registry Index.
-                        // https://github.com/containers/common/pull/803
                         if (!index) {
                             index = image.Name.split('/')[0];
                         }
@@ -478,7 +442,6 @@ export class ImageRunModal extends React.Component {
     };
 
     clearImageSelection = () => {
-        // Reset command if it was prefilled
         let command = this.state.command;
         if (this.state.command === utils.quote_cmdline(this.state.selectedImage?.Command))
             command = "";
@@ -520,7 +483,6 @@ export class ImageRunModal extends React.Component {
     handleImageSelectInput = value => {
         this.setState({
             searchText: value,
-            // Reset searchFinished status when text input changes
             searchFinished: false,
             selectedImage: "",
         });
@@ -551,10 +513,7 @@ export class ImageRunModal extends React.Component {
             imageRegistries.push(this.state.searchByRegistry);
         }
 
-        // Strip out all non-allowed container image characters when filtering.
         let regexString = searchText.replace(/[^\w_.:-]/g, "");
-        // Strip image registry option if set; comparing results for docker.io searching for docker.io/fedora
-        // returns docker.io/$username/fedora for example.
         if (regexString.includes('/')) {
             regexString = searchText.replace(searchText.split('/')[0], '');
         }
@@ -582,9 +541,8 @@ export class ImageRunModal extends React.Component {
                     );
                 }
             })
-            .filter(group => group.length !== 0); // filter out empty groups
+            .filter(group => group.length !== 0);
 
-        // Remove <SelectGroup> when there is a filter selected.
         if (this.state.searchByRegistry !== 'all' && imageRegistries.length === 1 && results.length === 1) {
             return results[0].props.children;
         }
@@ -592,7 +550,6 @@ export class ImageRunModal extends React.Component {
         return results;
     };
 
-    // Similar to the output of docker search and docker's /images/search endpoint: show only the root domain.
     truncateRegistryDomain = (domain) => {
         const parts = domain.split('.');
         if (parts.length > 2) {
@@ -612,10 +569,9 @@ export class ImageRunModal extends React.Component {
 
     isFormInvalid = validationFailed => {
         const groupHasError = row => row && Object.values(row)
-            .filter(val => val) // Filter out empty/undefined properties
-            .length > 0; // If one field has error, the whole group (dynamicList) is invalid
+            .filter(val => val)
+            .length > 0;
 
-        // If at least one group is invalid, then the whole form is invalid
         return validationFailed.publish?.some(groupHasError) ||
             validationFailed.volumes?.some(groupHasError) ||
             validationFailed.env?.some(groupHasError) ||
@@ -682,13 +638,6 @@ export class ImageRunModal extends React.Component {
         return !this.isFormInvalid(validationFailed);
     }
 
-    /* Updates a validation object of the whole dynamic list's form (e.g. the whole port-mapping form)
-    *
-    * Arguments
-    *   - key: [publish/volumes/env] - Specifies the validation of which dynamic form of the Image run dialog is being updated
-    *   - value: An array of validation errors of the form. Each item of the array represents a row of the dynamic list.
-    *            Index needs to corellate with a row number
-    */
     dynamicListOnValidationChange = (key, value) => {
         const validationFailedDelta = { ...this.state.validationFailed };
 
@@ -715,7 +664,6 @@ export class ImageRunModal extends React.Component {
         const localImage = this.state.image || (selectedImage && this.props.localImages.some(img => img.Id === selectedImage.Id));
         const dockerRegistries = registries && registries.search ? registries.search : utils.fallbackRegistries;
 
-        // Add the search component
         const footer = (
             <ToggleGroup className='image-search-footer' aria-label={_("Search by registry")}>
                 <ToggleGroupItem
@@ -804,8 +752,6 @@ export class ImageRunModal extends React.Component {
                             }
                         >
                             <Select
-                                // We are unable to set id of the input directly, the select component appends
-                                // '-select-typeahead' to toggleId.
                                 toggleId='create-image-image'
                                 isGrouped
                                 {...(this.state.searchInProgress && { loadingVariant: 'spinner' })}
@@ -819,7 +765,6 @@ export class ImageRunModal extends React.Component {
                                 placeholderText={_("Search string or container location")}
                                 onSelect={this.onImageSelect}
                                 onClear={this.clearImageSelection}
-                                // onFilter must be set or the spinner crashes https://github.com/patternfly/patternfly-react/issues/6384
                                 onFilter={() => {}}
                                 onTypeaheadInputChanged={this.debouncedInputChanged}
                                 footer={footer}
@@ -1212,7 +1157,6 @@ export class ImageRunModal extends React.Component {
                 position="top"
                 variant="medium"
                 onClose={Dialogs.close}
-                // TODO: still not ideal on chromium https://github.com/patternfly/patternfly-react/issues/6471
                 onEscapePress={() => {
                     if (this.state.isImageSelectOpen) {
                         this.onImageSelectToggle(!this.state.isImageSelectOpen);
