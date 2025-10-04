@@ -164,6 +164,7 @@ AUTH="${token ? `Authorization: Bearer ${'${TOKEN}'}"` : ""}"
 TOKEN="${token || ""}"
 
 URL="https://ghcr.io/v2/versa-node/\${REPO}/tags/list?n=200"
+console.log(URL);
 
 if [ -n "$TOKEN" ]; then
   curl -fsSL -H "$UA" -H "Accept: application/json" -H "Authorization: Bearer $TOKEN" "$URL"
