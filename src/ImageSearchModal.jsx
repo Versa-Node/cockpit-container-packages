@@ -82,7 +82,7 @@ fi
     const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
     const pkgs = JSON.parse(out || "[]");
     console.debug("[GHCR] Org packages fetched:", pkgs.length);
-    // Start with GH package description if present; we'll enrich with OCI label later.
+    // Start with GH package description if present; we'll try to enrich with OCI label later.
     return (pkgs || []).map(p => ({
       name: `ghcr.io/versa-node/${p.name}`,
       description: (p.description || "").trim(),
@@ -94,55 +94,99 @@ fi
 }
 
 /**
- * Retrieve an anonymous (or PAT-authenticated) Bearer token for GHCR Registry v2.
- * We use the standard /token endpoint so we do NOT need to docker pull the image.
+ * Acquire a short-lived GHCR registry token (JWT) for the given repo.
+ * Strategy:
+ *  1) Try anonymous (works for public packages).
+ *  2) If /etc/versanode/github.token exists, optionally read username from
+ *     /etc/versanode/github.user (recommended). Exchange via Basic auth.
+ *  3) Fall back to a couple of safe Basic variants if username unknown.
+ * The function NEVER logs the token itself.
  */
 async function ghcrGetRegistryTokenViaSpawn(repo) {
   const script = `
 set -euo pipefail
-REPO="${repo}"
-UA="User-Agent: versanode-cockpit/1.0"
-URL="https://ghcr.io/token?service=ghcr.io&scope=repository:versa-node/\${REPO}:pull"
 
-# Try anonymous first
+REPO="${repo}"
+SCOPE="repository:versa-node/\${REPO}:pull"
+BASE_URL="https://ghcr.io/token?service=ghcr.io&scope=\${SCOPE}"
+UA="User-Agent: versanode-cockpit/1.0"
+
+try_anon() {
+  curl -fsSL -H "$UA" "$BASE_URL" 2>/dev/null || return 1
+}
+
+try_basic() {
+  # $1=username  $2=pat
+  local AUTH
+  AUTH="$(printf '%s:%s' "$1" "$2" | base64 -w0 2>/dev/null || printf '%s:%s' "$1" "$2" | base64)"
+  curl -fsSL -H "$UA" -H "Authorization: Basic $AUTH" "$BASE_URL" 2>/dev/null || return 1
+}
+
+TOKEN_FILE="/etc/versanode/github.token"
+USER_FILE="/etc/versanode/github.user"
+
+# 1) anonymous
 set +e
-RESP="$(curl -fsSL -H "$UA" "$URL")"
+RESP="$(try_anon)"
 EC=$?
 set -e
+if [ $EC -eq 0 ] && [ -n "$RESP" ]; then
+  echo "$RESP"
+  exit 0
+fi
 
-if [ $EC -ne 0 ] || [ -z "$RESP" ]; then
-  # Optional: try with PAT (if provided) using Basic auth to exchange for a token.
-  TOKEN_FILE="/etc/versanode/github.token"
-  if [ -r "$TOKEN_FILE" ]; then
-    PAT="$(tr -d '\\r\\n' < "$TOKEN_FILE")"
-    if [ -n "$PAT" ]; then
-      # GitHub accepts any username for PAT on this endpoint; 'token' is commonly used.
-      BASIC="$(printf 'token:%s' "$PAT" | base64 -w0 2>/dev/null || printf 'token:%s' "$PAT" | base64)"
-      set +e
-      RESP="$(curl -fsSL -H "$UA" -H "Authorization: Basic $BASIC" "$URL")"
-      EC=$?
-      set -e
-    fi
+# 2) PAT available?
+if [ ! -r "$TOKEN_FILE" ]; then
+  echo ""
+  exit 0
+fi
+PAT="$(tr -d '\\r\\n' < "$TOKEN_FILE")"
+if [ -z "$PAT" ]; then
+  echo ""
+  exit 0
+fi
+
+# username?
+USER=""
+if [ -r "$USER_FILE" ]; then
+  USER="$(tr -d '\\r\\n' < "$USER_FILE")"
+fi
+
+# 2a) If we have an explicit username, use it
+if [ -n "$USER" ]; then
+  set +e
+  RESP="$(try_basic "$USER" "$PAT")"
+  EC=$?
+  set -e
+  if [ $EC -eq 0 ] && [ -n "$RESP" ]; then
+    echo "$RESP"
+    exit 0
   fi
 fi
 
-if [ $EC -ne 0 ] || [ -z "$RESP" ]; then
-  echo ""
-else
-  python3 - <<'PY' 2>/dev/null
-import sys, json
-try:
-    print((json.load(sys.stdin).get("token") or "").strip())
-except Exception:
-    print("")
-PY
-  <<< "$RESP"
-fi
+# 2b) Fallbacks if username not supplied (some registries accept these)
+for U in "oauth2" "token" ""; do
+  set +e
+  RESP="$(try_basic "$U" "$PAT")"
+  EC=$?
+  set -e
+  if [ $EC -eq 0 ] && [ -n "$RESP" ]; then
+    echo "$RESP"
+    exit 0
+  fi
+done
+
+# nothing worked
+echo ""
 `;
   try {
     const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
-    const token = (out || "").trim();
-    console.debug("[GHCR] token acquired?", Boolean(token));
+    if (!out) {
+      console.debug("[GHCR] token: none (anonymous + PAT exchange failed)");
+      return "";
+    }
+    const token = (JSON.parse(out).token || "").trim();
+    console.debug("[GHCR] token acquired for", repo, "?", Boolean(token));
     return token;
   } catch (e) {
     console.warn("[GHCR] ghcrGetRegistryTokenViaSpawn failed:", e?.message || e);
@@ -154,24 +198,20 @@ fi
 async function fetchGhcrTagsViaSpawn(fullName) {
   const repo = parseGhcrRepoName(fullName);
   if (!repo) return [];
+  console.debug("[GHCR] fetching tags for", repo);
 
   const token = await ghcrGetRegistryTokenViaSpawn(repo);
-  REPO="${repo}"
-  console.log("URL IS", repo, REPO);
+
   const script = `
 set -euo pipefail
 REPO="${repo}"
 UA="User-Agent: versanode-cockpit/1.0"
-AUTH="${token ? `Authorization: Bearer ${'${TOKEN}'}"` : ""}"
-TOKEN="${token || ""}"
-
 URL="https://ghcr.io/v2/versa-node/\${REPO}/tags/list?n=200"
 
-
-if [ -n "$TOKEN" ]; then
-  curl -fsSL -H "$UA" -H "Accept: application/json" -H "Authorization: Bearer $TOKEN" "$URL"
+if [ -n "${token}" ]; then
+  curl -fsSL -H "$UA" -H "Accept: application/json" -H "Docker-Distribution-API-Version: registry/2.0" -H "Authorization: Bearer ${token}" "$URL"
 else
-  curl -fsSL -H "$UA" -H "Accept: application/json" "$URL"
+  curl -fsSL -H "$UA" -H "Accept: application/json" -H "Docker-Distribution-API-Version: registry/2.0" "$URL"
 fi
 `;
   try {
@@ -184,7 +224,7 @@ fi
       if (b === 'latest') return 1;
       return b.localeCompare(a, undefined, { numeric: true, sensitivity: 'base' });
     });
-    console.debug("[GHCR] Tags for", fullName, "=>", uniq.slice(0, 10), uniq.length > 10 ? `(+${uniq.length - 10} more)` : "");
+    console.debug("[GHCR] tags:", repo, "=>", uniq.slice(0, 10), uniq.length > 10 ? `(+${uniq.length - 10})` : "");
     return uniq;
   } catch (e) {
     console.warn("[GHCR] fetchGhcrTagsViaSpawn failed:", e?.message || e);
@@ -193,7 +233,7 @@ fi
 }
 
 // Fetch org.opencontainers.image.description from the OCI/Docker config for a repo:tag
-// Uses token endpoint; does NOT require pulling the image locally.
+// Uses registry token; does NOT require pulling the image locally.
 async function fetchGhcrOciDescriptionViaSpawn(fullName, tagIn) {
   const repo = parseGhcrRepoName(fullName);
   let tag = (tagIn || "latest").trim();
@@ -201,6 +241,9 @@ async function fetchGhcrOciDescriptionViaSpawn(fullName, tagIn) {
   if (!/^[A-Za-z0-9._-]+$/.test(tag)) tag = "latest";
 
   const token = await ghcrGetRegistryTokenViaSpawn(repo);
+  if (!token) {
+    console.debug("[GHCR] no token for", repo, "— will not attempt label fetch");
+  }
 
   const script = `
 set -euo pipefail
@@ -210,15 +253,15 @@ TAG="${tag}"
 
 UA="User-Agent: versanode-cockpit/1.0"
 ACCEPT_ALL="Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
-AUTH_H="${token ? `-H 'Authorization: Bearer ${'${TOKEN}'}'` : ""}"
-TOKEN="${token || ""}"
+AUTH_H=""
+if [ -n "${token}" ]; then AUTH_H="-H Authorization: Bearer ${token}"; fi
 
 fetch() {
   # $1: URL
-  if [ -n "$TOKEN" ]; then
-    curl -fsSL -H "$UA" -H "$ACCEPT_ALL" -H "Authorization: Bearer $TOKEN" "$1"
+  if [ -n "${token}" ]; then
+    curl -fsSL -H "$UA" -H "$ACCEPT_ALL" -H "Docker-Distribution-API-Version: registry/2.0" -H "Authorization: Bearer ${token}" "$1"
   else
-    curl -fsSL -H "$UA" -H "$ACCEPT_ALL" "$1"
+    curl -fsSL -H "$UA" -H "$ACCEPT_ALL" -H "Docker-Distribution-API-Version: registry/2.0" "$1"
   fi
 }
 
@@ -232,18 +275,15 @@ import sys, json
 m=json.load(sys.stdin)
 t=m.get("mediaType","")
 if "image.index" in t or "manifest.list" in t:
-    # choose linux/amd64
     for e in m.get("manifests",[]):
         p=e.get("platform") or {}
         if (p.get("os")=="linux" and p.get("architecture")=="amd64"):
             print("INDEX:"+e.get("digest",""))
             break
     else:
-        # fallback first entry
         e=(m.get("manifests") or [{}])[0]
         print("INDEX:"+e.get("digest",""))
 else:
-    # schema2 manifest
     cfg=(m.get("config") or {})
     print("MANIFEST:"+cfg.get("digest",""))
 PY
@@ -286,7 +326,7 @@ PY
   try {
     const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
     const desc = (out || "").trim();
-    console.debug("[GHCR] OCI description for", `${fullName}:${tag}`, "=>", desc ? desc.substring(0, 80) + (desc.length > 80 ? "…" : "") : "<empty>");
+    console.debug("[GHCR] label description", `${repo}:${tag}`, "=>", desc ? desc.substring(0, 80) + (desc.length > 80 ? "…" : "") : "<empty>");
     return desc;
   } catch (e) {
     console.warn("[GHCR] fetchGhcrOciDescriptionViaSpawn failed:", e?.message || e);
@@ -404,15 +444,9 @@ export const ImageSearchModal = ({ downloadImage }) => {
             }
             return next;
           });
-        } else if (!img.description) {
-          // fallback placeholder so UI isn't blank
-          setImageList((prev) => {
-            const next = [...prev];
-            if (next[idx] && next[idx].name === img.name && !next[idx].description) {
-              next[idx] = { ...next[idx], description: "" };
-            }
-            return next;
-          });
+        } else {
+          // Keep whatever GitHub Package description we already had (or blank)
+          console.debug("[GHCR] No OCI description for", img.name, "— leaving GH package description");
         }
       })();
     }
@@ -491,10 +525,10 @@ export const ImageSearchModal = ({ downloadImage }) => {
       setGhcrOrgListing(true);
       try {
         const pkgs = await fetchGhcrOrgPackagesViaSpawn();
-        // Seed with placeholder if empty to avoid totally blank column
+        // Seed with placeholder so the column isn't blank; will be enriched
         const seeded = pkgs.map(p => ({
           ...p,
-          description: p.description || PLACEHOLDER_DESC,
+          description: p.description || "", // use GH package description if present
         }));
         setImageList(seeded);
         setSelected(seeded.length ? "0" : "");
@@ -516,13 +550,13 @@ export const ImageSearchModal = ({ downloadImage }) => {
         setImageList([]);
         setSelected("");
       } else {
-        // Start with placeholder, then enrich from OCI label
-        const row = { name: fullName, description: PLACEHOLDER_DESC };
+        // Start with GH pkg description empty; then try OCI label
+        const row = { name: fullName, description: "" };
         setImageList([row]);
         setSelected("0");
         fetchGhcrOciDescriptionViaSpawn(fullName, "latest")
           .then(desc => {
-            setImageList([{ name: fullName, description: desc || "" }]);
+            if (desc) setImageList([{ name: fullName, description: desc }]);
           })
           .catch(() => {});
       }
@@ -581,7 +615,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
           }
         }
         console.debug("[Search] results:", results.length);
-        // Ensure description key exists so UI doesn't render undefined
+        // Normalize description key (some registries use Description)
         const normalized = (results || []).map(r => ({
           ...r,
           description: (r.description || r.Description || "").trim(),
@@ -625,7 +659,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
     Dialogs.close();
   };
 
-  // Tag picker UI: show a combobox (FormSelect) when we have tagOptions; else fallback to text input.
+  // Tag picker UI: show a combobox (FormSelect) when we have tagOptions; else free text input.
   const TagPicker = () => {
     if (tagLoading) {
       return (
@@ -774,9 +808,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
                         </DataListCell>,
                         <DataListCell key="secondary content" wrapModifier="truncate">
                           <span className="image-description">
-                            {image.description && image.description !== PLACEHOLDER_DESC
-                              ? image.description
-                              : (image.description === PLACEHOLDER_DESC ? PLACEHOLDER_DESC : "")}
+                            {image.description || ""}
                           </span>
                         </DataListCell>
                       ]}
