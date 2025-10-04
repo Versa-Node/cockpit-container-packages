@@ -156,7 +156,8 @@ async function fetchGhcrTagsViaSpawn(fullName) {
   if (!repo) return [];
 
   const token = await ghcrGetRegistryTokenViaSpawn(repo);
-  console.log("URL IS", "https://ghcr.io/v2/versa-node/\${repo}/tags/list?n=200");
+  REPO="${repo}"
+  console.log("URL IS", "https://ghcr.io/v2/versa-node/\${REPO}/tags/list?n=200");
   const script = `
 set -euo pipefail
 REPO="${repo}"
