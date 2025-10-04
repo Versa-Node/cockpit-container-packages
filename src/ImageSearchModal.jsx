@@ -46,8 +46,7 @@ const parseGhcrRepoName = (full) => {
 };
 
 // -------------------- ORG LIST (GitHub Packages REST) --------------------
-// Server-side (host) fetch via cockpit.spawn (avoids CSP).
-// If token file is missing or not permitted, return an empty list silently.
+// If token file is present we use it; otherwise anonymous works for public packages.
 async function fetchGhcrOrgPackagesViaSpawn() {
   const script = `
 set -euo pipefail
@@ -57,37 +56,21 @@ HDR_API="X-GitHub-Api-Version: 2022-11-28"
 UA="User-Agent: versanode-cockpit/1.0"
 TOKEN_FILE="/etc/versanode/github.token"
 
-if [ ! -r "$TOKEN_FILE" ]; then
-  # anonymous is fine for public org package list
-  set +e
-  RESP="$(curl -fsSL -H "$HDR_ACCEPT" -H "$HDR_API" -H "$UA" "$URL")"
-  EC=$?
-  set -e
-  if [ $EC -ne 0 ] || [ -z "$RESP" ]; then echo "[]"; else echo "$RESP"; fi
-  exit 0
+if [ -r "$TOKEN_FILE" ]; then
+  TOKEN="$(tr -d '\\r\\n' < "$TOKEN_FILE")"
 fi
 
-TOKEN="$(tr -d '\\r\\n' < "$TOKEN_FILE")"
-if [ -z "$TOKEN" ]; then
-  echo "[]"
-  exit 0
-fi
-
-set +e
-RESP="$(curl -fsSL -H "$HDR_ACCEPT" -H "$HDR_API" -H "$UA" -H "Authorization: Bearer $TOKEN" "$URL")"
-EC=$?
-set -e
-if [ $EC -ne 0 ] || [ -z "$RESP" ]; then
-  echo "[]"
+if [ -n "${TOKEN:-}" ]; then
+  curl -fsSL -H "$HDR_ACCEPT" -H "$HDR_API" -H "$UA" -H "Authorization: Bearer $TOKEN" "$URL"
 else
-  echo "$RESP"
+  curl -fsSL -H "$HDR_ACCEPT" -H "$HDR_API" -H "$UA" "$URL"
 fi
 `;
   try {
     const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
     const pkgs = JSON.parse(out || "[]");
     console.debug("[GHCR] Org packages fetched:", pkgs.length);
-    // Start with GitHub Package description if present
+    // Start with GitHub Package description (source of truth on GHCR page)
     return (pkgs || []).map(p => ({
       name: `ghcr.io/versa-node/${p.name}`,
       description: (p.description || "").trim(),
@@ -95,6 +78,41 @@ fi
   } catch (e) {
     console.warn("[GHCR] fetchGhcrOrgPackagesViaSpawn failed:", e?.message || e);
     return [];
+  }
+}
+
+// Fetch a single package description from GitHub Packages REST
+async function fetchGhcrPackageDescriptionViaSpawn(packageName) {
+  const safe = (packageName || "").replace(/[^a-zA-Z0-9._-]/g, "");
+  if (!safe) return "";
+  const script = `
+set -euo pipefail
+URL="https://api.github.com/orgs/${GH_ORG}/packages/container/${safe}"
+HDR_ACCEPT="Accept: application/vnd.github+json"
+HDR_API="X-GitHub-Api-Version: 2022-11-28"
+UA="User-Agent: versanode-cockpit/1.0"
+TOKEN_FILE="/etc/versanode/github.token"
+
+if [ -r "$TOKEN_FILE" ]; then
+  TOKEN="$(tr -d '\\r\\n' < "$TOKEN_FILE")"
+fi
+
+if [ -n "${TOKEN:-}" ]; then
+  curl -fsSL -H "$HDR_ACCEPT" -H "$HDR_API" -H "$UA" -H "Authorization: Bearer $TOKEN" "$URL"
+else
+  curl -fsSL -H "$HDR_ACCEPT" -H "$HDR_API" -H "$UA" "$URL"
+fi
+`;
+  try {
+    const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
+    if (!out) return "";
+    const data = JSON.parse(out);
+    const desc = (data?.description || "").trim();
+    console.debug("[GHCR] Package REST description", safe, "=>", desc ? desc.substring(0, 80) + (desc.length > 80 ? "…" : "") : "<empty>");
+    return desc;
+  } catch (e) {
+    console.warn("[GHCR] fetchGhcrPackageDescriptionViaSpawn failed:", e?.message || e);
+    return "";
   }
 }
 
@@ -108,12 +126,9 @@ SCOPE="repository:versa-node/\${REPO}:pull"
 BASE_URL="https://ghcr.io/token?service=ghcr.io&scope=\${SCOPE}"
 UA="User-Agent: versanode-cockpit/1.0"
 
-try_anon() {
-  curl -fsSL -H "$UA" "$BASE_URL" 2>/dev/null || return 1
-}
+try_anon() { curl -fsSL -H "$UA" "$BASE_URL" 2>/dev/null || return 1; }
 
 try_basic() {
-  # $1=username  $2=pat
   local AUTH
   AUTH="$(printf '%s:%s' "$1" "$2" | base64 -w0 2>/dev/null || printf '%s:%s' "$1" "$2" | base64)"
   curl -fsSL -H "$UA" -H "Authorization: Basic $AUTH" "$BASE_URL" 2>/dev/null || return 1
@@ -122,55 +137,27 @@ try_basic() {
 TOKEN_FILE="/etc/versanode/github.token"
 USER_FILE="/etc/versanode/github.user"
 
-# 1) anonymous (works if package public)
 set +e
 RESP="$(try_anon)"
 EC=$?
 set -e
 if [ $EC -eq 0 ] && [ -n "$RESP" ]; then
-  echo "$RESP"
-  exit 0
+  echo "$RESP"; exit 0
 fi
 
-# 2) PAT available?
-if [ ! -r "$TOKEN_FILE" ]; then
-  echo ""
-  exit 0
-fi
-PAT="$(tr -d '\\r\\n' < "$TOKEN_FILE")"
-if [ -z "$PAT" ]; then
-  echo ""
-  exit 0
+if [ -r "$TOKEN_FILE" ]; then PAT="$(tr -d '\\r\\n' < "$TOKEN_FILE")"; fi
+[ -n "${PAT:-}" ] || { echo ""; exit 0; }
+
+if [ -r "$USER_FILE" ]; then USER="$(tr -d '\\r\\n' < "$USER_FILE")"; fi
+
+if [ -n "${USER:-}" ]; then
+  set +e; RESP="$(try_basic "$USER" "$PAT")"; EC=$?; set -e
+  [ $EC -eq 0 ] && [ -n "$RESP" ] && { echo "$RESP"; exit 0; }
 fi
 
-# username?
-USER=""
-if [ -r "$USER_FILE" ]; then
-  USER="$(tr -d '\\r\\n' < "$USER_FILE")"
-fi
-
-# 2a) If we have an explicit username, use it
-if [ -n "$USER" ]; then
-  set +e
-  RESP="$(try_basic "$USER" "$PAT")"
-  EC=$?
-  set -e
-  if [ $EC -eq 0 ] && [ -n "$RESP" ]; then
-    echo "$RESP"
-    exit 0
-  fi
-fi
-
-# 2b) Fallback usernames some registries accept
 for U in "oauth2" "token" ""; do
-  set +e
-  RESP="$(try_basic "$U" "$PAT")"
-  EC=$?
-  set -e
-  if [ $EC -eq 0 ] && [ -n "$RESP" ]; then
-    echo "$RESP"
-    exit 0
-  fi
+  set +e; RESP="$(try_basic "$U" "$PAT")"; EC=$?; set -e
+  [ $EC -eq 0 ] && [ -n "$RESP" ] && { echo "$RESP"; exit 0; }
 done
 
 echo ""
@@ -250,7 +237,6 @@ UA="User-Agent: versanode-cockpit/1.0"
 ACCEPT_ALL="Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
 
 fetch() {
-  # $1: URL
   if [ -n "${token}" ]; then
     curl -fsSL -H "$UA" -H "$ACCEPT_ALL" -H "Docker-Distribution-API-Version: registry/2.0" -H "Authorization: Bearer ${token}" "$1"
   else
@@ -258,11 +244,9 @@ fetch() {
   fi
 }
 
-# 1) Fetch top manifest (could be index or manifest)
 MAN_URL="https://ghcr.io/v2/versa-node/\${REPO}/manifests/\${TAG}"
 MAN="$(fetch "$MAN_URL")" || { echo ""; exit 0; }
 
-# 2) Examine mediaType; if index, pick linux/amd64 manifest digest
 TYPE="$(python3 - <<'PY' 2>/dev/null
 import sys, json
 m=json.load(sys.stdin)
@@ -304,7 +288,6 @@ esac
 
 [ -n "$CFG_DIG" ] || { echo ""; exit 0; }
 
-# 3) Fetch config blob and extract label
 CFG_URL="https://ghcr.io/v2/versa-node/\${REPO}/blobs/\${CFG_DIG}"
 CFG="$(fetch "$CFG_URL")" || { echo ""; exit 0; }
 
@@ -323,58 +306,6 @@ PY
     return desc;
   } catch (e) {
     console.warn("[GHCR] fetchGhcrOciDescriptionViaSpawn failed:", e?.message || e);
-    return "";
-  }
-}
-
-// -------------------- FALLBACK: parse Dockerfile in GitHub repo --------------------
-// No auth needed; reads the Dockerfile on main branch and extracts
-//   org.opencontainers.image.description
-async function fetchDescriptionFromRepoDockerfileViaSpawn(repo) {
-  const safe = (repo || "").replace(/[^a-zA-Z0-9._-]/g, "");
-  if (!safe) return "";
-  const script = `
-set -euo pipefail
-UA="User-Agent: versanode-cockpit/1.0"
-RAW="https://raw.githubusercontent.com/Versa-Node/container-packages/main/packages/${safe}/Dockerfile"
-
-set +e
-BODY="$(curl -fsSL -H "$UA" "$RAW")"
-EC=$?
-set -e
-if [ $EC -ne 0 ] || [ -z "$BODY" ]; then
-  echo ""
-  exit 0
-fi
-
-python3 - <<'PY' 2>/dev/null
-import sys, re
-text=sys.stdin.read()
-
-# try both LABEL k=v and LABEL "k"="v" styles, single or double quotes
-patterns = [
-  r'org\\.opencontainers\\.image\\.description\\s*=\\s*"([^"]*)"',
-  r'org\\.opencontainers\\.image\\.description\\s*=\\s*\\\'([^\\\']*)\\\'',
-  r'"org\\.opencontainers\\.image\\.description"\\s*=\\s*"([^"]*)"',
-  r"['\\\"]org\\.opencontainers\\.image\\.description['\\\"]\\s*=\\s*['\\\"]([^'\\\"]*)['\\\"]",
-]
-for pat in patterns:
-    m=re.search(pat, text)
-    if m:
-        print((m.group(1) or '').strip())
-        break
-else:
-    print('')
-PY
-<<< "$BODY"
-`;
-  try {
-    const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
-    const desc = (out || "").trim();
-    console.debug("[GH] fallback Dockerfile description", safe, "=>", desc ? desc : "<empty>");
-    return desc;
-  } catch (e) {
-    console.warn("[GH] fetchDescriptionFromRepoDockerfileViaSpawn failed:", e?.message || e);
     return "";
   }
 }
@@ -477,13 +408,13 @@ export const ImageSearchModal = ({ downloadImage }) => {
         }
       })();
 
-      // Fetch description label (registry) → fall back to parsing Dockerfile if needed
+      // Description: prefer GitHub Packages REST; if empty, try OCI label for the tag
       (async () => {
-        const tag = selectedTag || "latest";
-        let desc = await fetchGhcrOciDescriptionViaSpawn(img.name, tag);
+        const repo = parseGhcrRepoName(img.name);
+        let desc = await fetchGhcrPackageDescriptionViaSpawn(repo);
         if (!desc) {
-          const repo = parseGhcrRepoName(img.name);
-          desc = await fetchDescriptionFromRepoDockerfileViaSpawn(repo);
+          const tag = selectedTag || "latest";
+          desc = await fetchGhcrOciDescriptionViaSpawn(img.name, tag);
         }
         if (desc) {
           setImageList((prev) => {
@@ -513,11 +444,8 @@ export const ImageSearchModal = ({ downloadImage }) => {
     (async () => {
       const tag = selectedTag || "latest";
       console.debug("[UI] Tag changed for", img.name, "->", tag);
-      let desc = await fetchGhcrOciDescriptionViaSpawn(img.name, tag);
-      if (!desc) {
-        const repo = parseGhcrRepoName(img.name);
-        desc = await fetchDescriptionFromRepoDockerfileViaSpawn(repo);
-      }
+      // Only try tag-specific OCI label here; the GH package desc is tag-agnostic and already set.
+      const desc = await fetchGhcrOciDescriptionViaSpawn(img.name, tag);
       if (desc) {
         setImageList((prev) => {
           const next = [...prev];
@@ -531,29 +459,30 @@ export const ImageSearchModal = ({ downloadImage }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedTag]);
 
-  // Enrich a GHCR org listing with label descriptions (latest) progressively
+  // Enrich a GHCR org listing with descriptions (prefer GH REST; else OCI label)
   async function enrichListWithDescriptions(list) {
     const out = [...list];
     for (let i = 0; i < out.length; i++) {
       const row = out[i];
       if (/^ghcr\.io\/versa-node\//i.test(row.name)) {
         try {
-          let desc = await fetchGhcrOciDescriptionViaSpawn(row.name, "latest");
-          if (!desc) {
+          if (!row.description) {
             const repo = parseGhcrRepoName(row.name);
-            desc = await fetchDescriptionFromRepoDockerfileViaSpawn(repo);
-          }
-          if (desc) {
-            out[i] = { ...row, description: desc };
-            // Update UI incrementally so user sees descriptions fill in
-            setImageList((prev) => {
-              const next = [...prev];
-              if (next[i] && next[i].name === row.name) {
-                next[i] = { ...next[i], description: desc };
-              }
-              return next;
-            });
-            console.debug("[Desc] enriched", row.name);
+            let desc = await fetchGhcrPackageDescriptionViaSpawn(repo);
+            if (!desc) {
+              desc = await fetchGhcrOciDescriptionViaSpawn(row.name, "latest");
+            }
+            if (desc) {
+              out[i] = { ...row, description: desc };
+              setImageList((prev) => {
+                const next = [...prev];
+                if (next[i] && next[i].name === row.name) {
+                  next[i] = { ...next[i], description: desc };
+                }
+                return next;
+              });
+              console.debug("[Desc] enriched", row.name);
+            }
           }
         } catch (e) {
           console.warn("[Desc] enrich failed for", row.name, e?.message || e);
@@ -574,7 +503,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
 
     console.debug("[UI] Search triggered:", { searchRegistry, targetGhcr, typedRepo, forceSearch, imageIdentifier });
 
-    // If GHCR targeted and no specific repo typed yet, try listing org packages
+    // If GHCR targeted and no specific repo typed yet, list org packages (public)
     if (targetGhcr && typedRepo.length === 0) {
       setDialogError(""); setDialogErrorDetail("");
       setSearchInProgress(true);
@@ -583,7 +512,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
         const pkgs = await fetchGhcrOrgPackagesViaSpawn();
         setImageList(pkgs);
         setSelected(pkgs.length ? "0" : "");
-        // Enrich with descriptions progressively (registry label → repo Dockerfile fallback)
+        // Enrich list (only rows missing desc)
         enrichListWithDescriptions(pkgs).catch(() => {});
       } finally {
         setSearchInProgress(false);
@@ -604,12 +533,12 @@ export const ImageSearchModal = ({ downloadImage }) => {
         const row = { name: fullName, description: "" };
         setImageList([row]);
         setSelected("0");
-        // Try to get label, then fallback to Dockerfile
+        // Try GH package description first, then OCI label
         (async () => {
-          let desc = await fetchGhcrOciDescriptionViaSpawn(fullName, "latest");
+          const repo = parseGhcrRepoName(fullName);
+          let desc = await fetchGhcrPackageDescriptionViaSpawn(repo);
           if (!desc) {
-            const repo = parseGhcrRepoName(fullName);
-            desc = await fetchDescriptionFromRepoDockerfileViaSpawn(repo);
+            desc = await fetchGhcrOciDescriptionViaSpawn(fullName, "latest");
           }
           if (desc) setImageList([{ name: fullName, description: desc }]);
         })().catch(() => {});
@@ -638,7 +567,6 @@ export const ImageSearchModal = ({ downloadImage }) => {
     if (searchRegistry !== "") {
       queryRegistries = [searchRegistry];
     }
-
     if (imageIdentifier.includes('/')) {
       queryRegistries = [""];
     }
