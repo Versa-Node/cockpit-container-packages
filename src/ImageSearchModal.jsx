@@ -20,8 +20,8 @@ import './ImageSearchModal.css';
 
 const _ = cockpit.gettext;
 
-// ---------- GHCR helpers ----------
-const GH_ORG = "Versa-Node";
+// ---------- GHCR helpers (only versa-node) ----------
+const GH_ORG = "versa-node"; // org is case-insensitive in API paths
 const GHCR_NAMESPACE = "ghcr.io/versa-node/";
 
 const isGhcr = (reg) => (reg || "").trim().toLowerCase() === "ghcr.io";
@@ -38,8 +38,8 @@ const buildGhcrVersaNodeName = (txt) => {
   return (GHCR_NAMESPACE + t).replace(/\/+$/, "");
 };
 
-// server-side (host) fetch via cockpit.spawn (avoids CSP)
-// reads PAT from /etc/versanode/github.token (0600, root:root)
+// Server-side (host) fetch via cockpit.spawn (avoids CSP).
+// If token file is missing or not permitted, return an empty list silently.
 async function fetchGhcrOrgPackagesViaSpawn() {
   const script = `
 set -euo pipefail
@@ -47,32 +47,40 @@ URL="https://api.github.com/orgs/${GH_ORG}/packages?package_type=container&per_p
 HDR_ACCEPT="Accept: application/vnd.github+json"
 HDR_API="X-GitHub-Api-Version: 2022-11-28"
 HDR_UA="User-Agent: versanode-cockpit/1.0"
-TOKEN_FILE="\${VERSANODE_GHCR_TOKEN_FILE:-/etc/versanode/github.token}"
+TOKEN_FILE="/etc/versanode/github.token"
 
 if [ ! -r "$TOKEN_FILE" ]; then
-  exit 40
+  echo "[]"
+  exit 0
 fi
 
-TOKEN="$(tr -d '\\r\\n' < "$TOKEN_FILE" || true)"
+TOKEN="$(tr -d '\\r\\n' < "$TOKEN_FILE")"
 if [ -z "$TOKEN" ]; then
-  exit 41
+  echo "[]"
+  exit 0
 fi
 
-curl -fsSL -H "$HDR_ACCEPT" -H "$HDR_API" -H "$HDR_UA" -H "Authorization: Bearer $TOKEN" "$URL"
+# Try the call, but never fail the script; fall back to [] on any error
+set +e
+RESP="$(curl -fsSL -H "$HDR_ACCEPT" -H "$HDR_API" -H "$HDR_UA" -H "Authorization: Bearer $TOKEN" "$URL")"
+EC=$?
+set -e
+if [ $EC -ne 0 ] || [ -z "$RESP" ]; then
+  echo "[]"
+else
+  echo "$RESP"
+fi
 `;
   try {
-    const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "out" });
+    const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
     const pkgs = JSON.parse(out || "[]");
     return (pkgs || []).map(p => ({
       name: `ghcr.io/versa-node/${p.name}`,
       description: p.description || "GitHub Container Registry (versa-node)",
     }));
-  } catch (e) {
-    const msg = String(e.message || e);
-    if (/(403|Not permitted|denied|code 40|code 41)/i.test(msg)) {
-      return [];
-    }
-    throw e;
+  } catch (_e) {
+    // On any parsing/spawn issue, just behave as if no packages are visible
+    return [];
   }
 }
 
@@ -87,13 +95,14 @@ export const ImageSearchModal = ({ downloadImage }) => {
   const [dialogError, setDialogError] = useState("");
   const [dialogErrorDetail, setDialogErrorDetail] = useState("");
   const [typingTimeout, setTypingTimeout] = useState(null);
-  const [ghcrOrgListing, setGhcrOrgListing] = useState(false);
+  const [ghcrOrgListing, setGhcrOrgListing] = useState(false); // show results even with empty input
 
   const activeConnectionRef = useRef(null);
 
   const { registries } = useDockerInfo();
   const Dialogs = useDialogs();
 
+  // Registries to use for searching; ensure ghcr.io is present
   const baseRegistries =
     (registries?.search && registries.search.length !== 0)
       ? registries.search
@@ -108,13 +117,15 @@ export const ImageSearchModal = ({ downloadImage }) => {
     }
   };
 
+  // Trigger a fetch on first open if ghcr is selected and the box is empty
   useEffect(() => {
     if (selectedRegistry === "ghcr.io" && imageIdentifier.trim() === "") {
       onSearchTriggered("ghcr.io", true);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, []); // run once on mount
 
+  // If user switches to ghcr.io and the query is empty, list org packages (silently falls back to empty if no token)
   useEffect(() => {
     if (selectedRegistry === "ghcr.io" && imageIdentifier.trim() === "") {
       onSearchTriggered("ghcr.io", true);
@@ -122,6 +133,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedRegistry]);
 
+  // Also, if the user clears the input while on ghcr, re-list the org
   useEffect(() => {
     if (selectedRegistry === "ghcr.io" && imageIdentifier.trim() === "") {
       onSearchTriggered("ghcr.io", true);
@@ -138,6 +150,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
       .replace(/^versa-node\/?/i, "")
       .trim();
 
+    // If GHCR targeted and no specific repo typed yet, try listing org packages (no error if not permitted)
     if (targetGhcr && typedRepo.length === 0) {
       setDialogError(""); setDialogErrorDetail("");
       setSearchInProgress(true);
@@ -146,11 +159,6 @@ export const ImageSearchModal = ({ downloadImage }) => {
         const pkgs = await fetchGhcrOrgPackagesViaSpawn();
         setImageList(pkgs);
         setSelected(pkgs.length ? "0" : "");
-      } catch (e) {
-        setImageList([]);
-        setSelected("");
-        setDialogError(_("Failed to list GHCR packages"));
-        setDialogErrorDetail(e.message || String(e));
       } finally {
         setSearchInProgress(false);
         setSearchFinished(true);
@@ -159,6 +167,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
       return;
     }
 
+    // If user typed a specific versa-node repo, synthesize the full name (no /images/search on GHCR)
     if (targetGhcr) {
       const fullName = buildGhcrVersaNodeName(imageIdentifier);
       const bareNamespace = GHCR_NAMESPACE.replace(/\/+$/, "");
@@ -176,6 +185,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
       return;
     }
 
+    // Docker Hub (or registries that support /images/search)
     if (imageIdentifier.length < 2 && !forceSearch) {
       setGhcrOrgListing(false);
       return;
@@ -215,6 +225,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
           if (result.status === "fulfilled") {
             results = results.concat(JSON.parse(result.value));
           } else {
+            // Don’t hard error; just show a gentle message once
             setDialogError(_("Failed to search for new images"));
             setDialogErrorDetail(result.reason
               ? cockpit.format(_("Failed to search for images: $0"), result.reason.message)
@@ -288,6 +299,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
     >
       <Form isHorizontal>
         {dialogError && <ErrorNotification errorMessage={dialogError} errorDetail={dialogErrorDetail} />}
+
         <Flex spaceItems={{ default: 'inlineFlex', modifier: 'spaceItemsXl' }}>
           <FormGroup fieldId="search-image-dialog-name" label={_("Search for")}>
             <TextInput
@@ -326,7 +338,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
       {!searchInProgress && !searchFinished && !ghcrOrgListing && imageIdentifier.trim() === "" && (
         <EmptyStatePanel
           title={_("No images found")}
-          paragraph={_("Start typing to look for images, or choose ghcr.io to list your org packages.")}
+          paragraph={_("Start typing to look for images, or choose ghcr.io to list org packages (if configured).")}
         />
       )}
 
