@@ -25,7 +25,7 @@ These commands check out the source and build it into the `dist/` directory:
 
 ```
 git clone https://github.com/Versa-Node/cockpit-container-packages
-cd cockpit-docker
+cd cockpit-container-packages
 make
 ```
 
