@@ -54,7 +54,7 @@ set -euo pipefail
 URL="https://api.github.com/orgs/${GH_ORG}/packages?package_type=container&per_page=100"
 HDR_ACCEPT="Accept: application/vnd.github+json"
 HDR_API="X-GitHub-Api-Version: 2022-11-28"
-HDR_UA="User-Agent: versanode-cockpit/1.0"
+UA="User-Agent: versanode-cockpit/1.0"
 TOKEN_FILE="/etc/versanode/github.token"
 
 if [ ! -r "$TOKEN_FILE" ]; then
@@ -69,7 +69,7 @@ if [ -z "$TOKEN" ]; then
 fi
 
 set +e
-RESP="$(curl -fsSL -H "$HDR_ACCEPT" -H "$HDR_API" -H "$HDR_UA" -H "Authorization: Bearer $TOKEN" "$URL")"
+RESP="$(curl -fsSL -H "$HDR_ACCEPT" -H "$HDR_API" -H "$UA" -H "Authorization: Bearer $TOKEN" "$URL")"
 EC=$?
 set -e
 if [ $EC -ne 0 ] || [ -z "$RESP" ]; then
@@ -93,48 +93,82 @@ fi
   }
 }
 
-// Fetch tags from GHCR Registry V2 API
-async function fetchGhcrTagsViaSpawn(fullName) {
-  const repo = parseGhcrRepoName(fullName);
-  if (!repo) return [];
-
+/**
+ * Retrieve an anonymous (or PAT-authenticated) Bearer token for GHCR Registry v2.
+ * We use the standard /token endpoint so we do NOT need to docker pull the image.
+ */
+async function ghcrGetRegistryTokenViaSpawn(repo) {
   const script = `
 set -euo pipefail
 REPO="${repo}"
-BASE="https://ghcr.io/v2/versa-node/\${REPO}/tags/list?n=200"
 UA="User-Agent: versanode-cockpit/1.0"
+URL="https://ghcr.io/token?service=ghcr.io&scope=repository:versa-node/\${REPO}:pull"
 
-try_no_auth() {
-  curl -fsSL -H "$UA" "$1" || return 1
-}
-
-try_with_auth() {
-  local TOKEN_FILE="/etc/versanode/github.token"
-  if [ ! -r "$TOKEN_FILE" ]; then
-    return 1
-  fi
-  local T
-  T="$(tr -d '\\r\\n' < "$TOKEN_FILE")"
-  [ -z "$T" ] && return 1
-  curl -fsSL -H "$UA" -H "Authorization: Bearer $T" "$1" || return 1
-}
-
+# Try anonymous first
 set +e
-RESP="$(try_no_auth "$BASE")"
+RESP="$(curl -fsSL -H "$UA" "$URL")"
 EC=$?
 set -e
 
 if [ $EC -ne 0 ] || [ -z "$RESP" ]; then
-  set +e
-  RESP="$(try_with_auth "$BASE")"
-  EC=$?
-  set -e
+  # Optional: try with PAT (if provided) using Basic auth to exchange for a token.
+  TOKEN_FILE="/etc/versanode/github.token"
+  if [ -r "$TOKEN_FILE" ]; then
+    PAT="$(tr -d '\\r\\n' < "$TOKEN_FILE")"
+    if [ -n "$PAT" ]; then
+      # GitHub accepts any username for PAT on this endpoint; 'token' is commonly used.
+      BASIC="$(printf 'token:%s' "$PAT" | base64 -w0 2>/dev/null || printf 'token:%s' "$PAT" | base64)"
+      set +e
+      RESP="$(curl -fsSL -H "$UA" -H "Authorization: Basic $BASIC" "$URL")"
+      EC=$?
+      set -e
+    fi
+  fi
 fi
 
 if [ $EC -ne 0 ] || [ -z "$RESP" ]; then
-  echo '{"tags":[]}'
+  echo ""
 else
-  echo "$RESP"
+  python3 - <<'PY' 2>/dev/null
+import sys, json
+try:
+    print((json.load(sys.stdin).get("token") or "").strip())
+except Exception:
+    print("")
+PY
+  <<< "$RESP"
+fi
+`;
+  try {
+    const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
+    const token = (out || "").trim();
+    console.debug("[GHCR] token acquired?", Boolean(token));
+    return token;
+  } catch (e) {
+    console.warn("[GHCR] ghcrGetRegistryTokenViaSpawn failed:", e?.message || e);
+    return "";
+  }
+}
+
+// Fetch tags from GHCR Registry V2 API (no docker pull needed).
+async function fetchGhcrTagsViaSpawn(fullName) {
+  const repo = parseGhcrRepoName(fullName);
+  if (!repo) return [];
+
+  const token = await ghcrGetRegistryTokenViaSpawn(repo);
+  const script = `
+set -euo pipefail
+REPO="${repo}"
+UA="User-Agent: versanode-cockpit/1.0"
+AUTH="${token ? `Authorization: Bearer ${'${TOKEN}'}"` : ""}"
+TOKEN="${token || ""}"
+
+URL="https://ghcr.io/v2/versa-node/\${REPO}/tags/list?n=200"
+
+if [ -n "$TOKEN" ]; then
+  curl -fsSL -H "$UA" -H "Accept: application/json" -H "Authorization: Bearer $TOKEN" "$URL"
+else
+  curl -fsSL -H "$UA" -H "Accept: application/json" "$URL"
 fi
 `;
   try {
@@ -142,7 +176,6 @@ fi
     const parsed = JSON.parse(out || '{"tags":[]}');
     const tags = Array.isArray(parsed.tags) ? parsed.tags : [];
     const uniq = Array.from(new Set(tags));
-    // Prefer "latest" first, then semver-ish/numeric
     uniq.sort((a, b) => {
       if (a === 'latest') return -1;
       if (b === 'latest') return 1;
@@ -157,13 +190,14 @@ fi
 }
 
 // Fetch org.opencontainers.image.description from the OCI/Docker config for a repo:tag
-// Works on multi-arch (follows manifest index -> linux/amd64 manifest -> config blob).
+// Uses token endpoint; does NOT require pulling the image locally.
 async function fetchGhcrOciDescriptionViaSpawn(fullName, tagIn) {
   const repo = parseGhcrRepoName(fullName);
   let tag = (tagIn || "latest").trim();
   if (!repo) return "";
-  // Keep only safe tag chars to avoid script injection
   if (!/^[A-Za-z0-9._-]+$/.test(tag)) tag = "latest";
+
+  const token = await ghcrGetRegistryTokenViaSpawn(repo);
 
   const script = `
 set -euo pipefail
@@ -173,21 +207,15 @@ TAG="${tag}"
 
 UA="User-Agent: versanode-cockpit/1.0"
 ACCEPT_ALL="Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
+AUTH_H="${token ? `-H 'Authorization: Bearer ${'${TOKEN}'}'` : ""}"
+TOKEN="${token || ""}"
 
 fetch() {
   # $1: URL
-  if ! curl -fsSL -H "$UA" -H "$ACCEPT_ALL" "$1"; then
-    TOKEN_FILE="/etc/versanode/github.token"
-    if [ -r "$TOKEN_FILE" ]; then
-      T="$(tr -d '\\r\\n' < "$TOKEN_FILE")"
-      if [ -n "$T" ]; then
-        curl -fsSL -H "$UA" -H "$ACCEPT_ALL" -H "Authorization: Bearer $T" "$1" || return 1
-      else
-        return 1
-      fi
-    else
-      return 1
-    fi
+  if [ -n "$TOKEN" ]; then
+    curl -fsSL -H "$UA" -H "$ACCEPT_ALL" -H "Authorization: Bearer $TOKEN" "$1"
+  else
+    curl -fsSL -H "$UA" -H "$ACCEPT_ALL" "$1"
   fi
 }
 
