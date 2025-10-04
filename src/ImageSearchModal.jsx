@@ -197,7 +197,7 @@ fetch() {
 }
 
 # 1) Fetch top manifest (could be index or manifest)
-MAN_URL="https://ghcr.io/v2/versa-node/${REPO}/manifests/${TAG}"
+MAN_URL="https://ghcr.io/v2/versa-node/\${REPO}/manifests/\${TAG}"
 MAN="$(fetch "$MAN_URL")" || { echo ""; exit 0; }
 
 # 2) Examine mediaType; if index, pick linux/amd64 manifest digest
@@ -225,9 +225,9 @@ PY
 
 case "$TYPE" in
   INDEX:*)
-    DIG="${TYPE#INDEX:}"
+    DIG="\${TYPE#INDEX:}"
     [ -n "$DIG" ] || { echo ""; exit 0; }
-    SUB_URL="https://ghcr.io/v2/versa-node/${REPO}/manifests/${DIG}"
+    SUB_URL="https://ghcr.io/v2/versa-node/\${REPO}/manifests/\${DIG}"
     SUB="$(fetch "$SUB_URL")" || { echo ""; exit 0; }
     CFG_DIG="$(python3 - <<'PY' 2>/dev/null
 import sys, json
@@ -237,7 +237,7 @@ PY
 <<< "$SUB")"
     ;;
   MANIFEST:*)
-    CFG_DIG="${TYPE#MANIFEST:}"
+    CFG_DIG="\${TYPE#MANIFEST:}"
     ;;
   *)
     echo ""; exit 0;;
@@ -246,7 +246,7 @@ esac
 [ -n "$CFG_DIG" ] || { echo ""; exit 0; }
 
 # 3) Fetch config blob and extract label
-CFG_URL="https://ghcr.io/v2/versa-node/${REPO}/blobs/${CFG_DIG}"
+CFG_URL="https://ghcr.io/v2/versa-node/\${REPO}/blobs/\${CFG_DIG}"
 CFG="$(fetch "$CFG_URL")" || { echo ""; exit 0; }
 
 python3 - <<'PY' 2>/dev/null
