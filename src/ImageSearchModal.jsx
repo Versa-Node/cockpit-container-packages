@@ -46,8 +46,7 @@ const parseGhcrRepoName = (full) => {
 };
 
 // -------------------- ORG LIST (GitHub Packages REST) --------------------
-// Server-side (host) fetch via cockpit.spawn (avoids CSP).
-// Token optional (anonymous works for public packages).
+// If token file is missing or not permitted, return an empty list silently.
 async function fetchGhcrOrgPackagesViaSpawn() {
   const script = `
 set -euo pipefail
@@ -57,23 +56,21 @@ HDR_API="X-GitHub-Api-Version: 2022-11-28"
 UA="User-Agent: versanode-cockpit/1.0"
 TOKEN_FILE="/etc/versanode/github.token"
 
-if [ ! -r "$TOKEN_FILE" ]; then
-  set +e
-  RESP="$(curl -fsSL -H "$HDR_ACCEPT" -H "$HDR_API" -H "$UA" "$URL")"
-  EC=$?
-  set -e
-  if [ $EC -ne 0 ] || [ -z "$RESP" ]; then echo "[]"; else echo "$RESP"; fi
-  exit 0
-fi
+try_curl() {
+  if [ -n "$1" ]; then
+    curl -fsSL -H "$HDR_ACCEPT" -H "$HDR_API" -H "$UA" -H "Authorization: Bearer $1" "$URL"
+  else
+    curl -fsSL -H "$HDR_ACCEPT" -H "$HDR_API" -H "$UA" "$URL"
+  fi
+}
 
-TOKEN="$(tr -d '\\r\\n' < "$TOKEN_FILE")"
-if [ -z "$TOKEN" ]; then
-  echo "[]"
-  exit 0
+TOKEN=""
+if [ -r "$TOKEN_FILE" ]; then
+  TOKEN="$(tr -d '\\r\\n' < "$TOKEN_FILE")"
 fi
 
 set +e
-RESP="$(curl -fsSL -H "$HDR_ACCEPT" -H "$HDR_API" -H "$UA" -H "Authorization: Bearer $TOKEN" "$URL")"
+RESP="$(try_curl "$TOKEN")"
 EC=$?
 set -e
 if [ $EC -ne 0 ] || [ -z "$RESP" ]; then
@@ -86,10 +83,9 @@ fi
     const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
     const pkgs = JSON.parse(out || "[]");
     console.debug("[GHCR] Org packages fetched:", pkgs.length);
-    // Start with GitHub Package description if present
     return (pkgs || []).map(p => ({
       name: `ghcr.io/versa-node/${p.name}`,
-      description: (p.description || "").trim(),
+      description: (p.description || "").trim(),  // GitHub package description (may be empty)
     }));
   } catch (e) {
     console.warn("[GHCR] fetchGhcrOrgPackagesViaSpawn failed:", e?.message || e);
@@ -99,21 +95,20 @@ fi
 
 // -------------------- TOKEN (Registry v2) --------------------
 async function ghcrGetRegistryTokenViaSpawn(repo) {
-  // Avoid ${...} in the script to keep JS template parsing happy
   const script = `
 set -euo pipefail
 
 REPO="${repo}"
-SCOPE="repository:versa-node/$REPO:pull"
-BASE_URL="https://ghcr.io/token?service=ghcr.io&scope=$SCOPE"
+SCOPE="repository:versa-node/\${REPO}:pull"
+BASE_URL="https://ghcr.io/token?service=ghcr.io&scope=\${SCOPE}"
 UA="User-Agent: versanode-cockpit/1.0"
 
 try_anon() {
   curl -fsSL -H "$UA" "$BASE_URL" 2>/dev/null || return 1
 }
-
 try_basic() {
   # $1=username  $2=pat
+  local AUTH
   AUTH="$(printf '%s:%s' "$1" "$2" | base64 -w0 2>/dev/null || printf '%s:%s' "$1" "$2" | base64)"
   curl -fsSL -H "$UA" -H "Authorization: Basic $AUTH" "$BASE_URL" 2>/dev/null || return 1
 }
@@ -121,65 +116,40 @@ try_basic() {
 TOKEN_FILE="/etc/versanode/github.token"
 USER_FILE="/etc/versanode/github.user"
 
-# 1) anonymous (works if package public)
+# 1) anonymous (public packages)
 set +e
 RESP="$(try_anon)"
 EC=$?
 set -e
 if [ $EC -eq 0 ] && [ -n "$RESP" ]; then
-  echo "$RESP"
-  exit 0
+  echo "$RESP"; exit 0
 fi
 
-# 2) PAT available?
+# 2) PAT?
 if [ ! -r "$TOKEN_FILE" ]; then
-  echo ""
-  exit 0
+  echo ""; exit 0
 fi
 PAT="$(tr -d '\\r\\n' < "$TOKEN_FILE")"
-if [ -z "$PAT" ]; then
-  echo ""
-  exit 0
-fi
+[ -z "$PAT" ] && { echo ""; exit 0; }
 
-# username?
 USER=""
-if [ -r "$USER_FILE" ]; then
-  USER="$(tr -d '\\r\\n' < "$USER_FILE")"
-fi
+if [ -r "$USER_FILE" ]; then USER="$(tr -d '\\r\\n' < "$USER_FILE")"; fi
 
-# 2a) explicit username
 if [ -n "$USER" ]; then
-  set +e
-  RESP="$(try_basic "$USER" "$PAT")"
-  EC=$?
-  set -e
-  if [ $EC -eq 0 ] && [ -n "$RESP" ]; then
-    echo "$RESP"
-    exit 0
-  fi
+  set +e; RESP="$(try_basic "$USER" "$PAT")"; EC=$?; set -e
+  if [ $EC -eq 0 ] && [ -n "$RESP" ]; then echo "$RESP"; exit 0; fi
 fi
 
-# 2b) fallback usernames some registries accept
-for U in oauth2 token ""; do
-  set +e
-  RESP="$(try_basic "$U" "$PAT")"
-  EC=$?
-  set -e
-  if [ $EC -eq 0 ] && [ -n "$RESP" ]; then
-    echo "$RESP"
-    exit 0
-  fi
+for U in "oauth2" "token" ""; do
+  set +e; RESP="$(try_basic "$U" "$PAT")"; EC=$?; set -e
+  if [ $EC -eq 0 ] && [ -n "$RESP" ]; then echo "$RESP"; exit 0; fi
 done
 
 echo ""
 `;
   try {
     const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
-    if (!out) {
-      console.debug("[GHCR] token: none (anonymous + PAT exchange failed)");
-      return "";
-    }
+    if (!out) return "";
     const token = (JSON.parse(out).token || "").trim();
     console.debug("[GHCR] token acquired for", repo, "?", Boolean(token));
     return token;
@@ -193,18 +163,18 @@ echo ""
 async function fetchGhcrTagsViaSpawn(fullName) {
   const repo = parseGhcrRepoName(fullName);
   if (!repo) return [];
-  console.debug("[GHCR] fetching tags for", repo);
-
   const token = await ghcrGetRegistryTokenViaSpawn(repo);
 
+  // DO NOT nest backticks inside this template string
   const script = `
 set -euo pipefail
 REPO="${repo}"
 UA="User-Agent: versanode-cockpit/1.0"
-URL="https://ghcr.io/v2/versa-node/$REPO/tags/list?n=200"
+URL="https://ghcr.io/v2/versa-node/\${REPO}/tags/list?n=200"
+TOKEN="${token || ""}"
 
-if [ -n "${token}" ]; then
-  curl -fsSL -H "$UA" -H "Accept: application/json" -H "Docker-Distribution-API-Version: registry/2.0" -H "Authorization: Bearer ${token}" "$URL"
+if [ -n "$TOKEN" ]; then
+  curl -fsSL -H "$UA" -H "Accept: application/json" -H "Docker-Distribution-API-Version: registry/2.0" -H "Authorization: Bearer $TOKEN" "$URL"
 else
   curl -fsSL -H "$UA" -H "Accept: application/json" -H "Docker-Distribution-API-Version: registry/2.0" "$URL"
 fi
@@ -227,7 +197,7 @@ fi
   }
 }
 
-// -------------------- DESCRIPTION (Registry v2 label) --------------------
+// -------------------- DESCRIPTION (index/manifest annotations, then config label) --------------------
 async function fetchGhcrOciDescriptionViaSpawn(fullName, tagIn) {
   const repo = parseGhcrRepoName(fullName);
   let tag = (tagIn || "latest").trim();
@@ -235,23 +205,18 @@ async function fetchGhcrOciDescriptionViaSpawn(fullName, tagIn) {
   if (!/^[A-Za-z0-9._-]+$/.test(tag)) tag = "latest";
 
   const token = await ghcrGetRegistryTokenViaSpawn(repo);
-  if (!token) {
-    console.debug("[GHCR] no token for", repo, "— attempting anonymous fetch");
-  }
 
-  // All ${...} in the script are JS-level (only for token interpolation). Bash uses $REPO/$TAG without braces.
   const script = `
 set -euo pipefail
 
 REPO="${repo}"
 TAG="${tag}"
-TOKEN="${token}"
+TOKEN="${token || ""}"
 
 UA="User-Agent: versanode-cockpit/1.0"
 ACPT="Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
 
 authcurl() {
-  # $1=url
   if [ -n "$TOKEN" ]; then
     curl -fsSL -H "$UA" -H "$ACPT" -H "Docker-Distribution-API-Version: registry/2.0" -H "Authorization: Bearer $TOKEN" "$1"
   else
@@ -259,20 +224,40 @@ authcurl() {
   fi
 }
 
-# 1) obtain the top manifest (could be index or manifest)
-TYPE="$(authcurl "https://ghcr.io/v2/versa-node/$REPO/manifests/$TAG" | python3 - <<'PY'
+# 1) Top manifest
+MAN_URL="https://ghcr.io/v2/versa-node/$REPO/manifests/$TAG"
+MAN="$(authcurl "$MAN_URL" 2>/dev/null || true)"
+if [ -z "$MAN" ]; then echo ""; exit 0; fi
+
+# 1a) Top-level annotations?
+TOP_ANN_DESC="$(python3 - <<'PY' <<< "$MAN"
 import sys, json
-m=json.load(sys.stdin)
+s=sys.stdin.read().strip()
+if not s: print(""); raise SystemExit(0)
+m=json.loads(s)
+ann=m.get("annotations") or {}
+print((ann.get("org.opencontainers.image.description") or "").strip())
+PY
+)"
+if [ -n "$TOP_ANN_DESC" ]; then
+  echo "$TOP_ANN_DESC"; exit 0
+fi
+
+# 2) Decide path (index vs single manifest)
+TYPE_AND_DIGEST="$(python3 - <<'PY' <<< "$MAN"
+import sys, json
+s=sys.stdin.read().strip()
+if not s: print(""); raise SystemExit(0)
+m=json.loads(s)
 t=m.get("mediaType","")
 if "image.index" in t or "manifest.list" in t:
-    mans=m.get("manifests") or []
     dig=None
-    for e in mans:
+    for e in m.get("manifests",[]):
         p=e.get("platform") or {}
         if p.get("os")=="linux" and p.get("architecture")=="amd64":
             dig=e.get("digest"); break
-    if not dig and mans:
-        dig=mans[0].get("digest")
+    if not dig and m.get("manifests"):
+        dig=(m["manifests"][0] or {}).get("digest")
     print("INDEX:"+ (dig or ""))
 else:
     cfg=(m.get("config") or {})
@@ -280,29 +265,53 @@ else:
 PY
 )"
 
-CFG_DIG=""
-case "$TYPE" in
+case "$TYPE_AND_DIGEST" in
   INDEX:*)
-    DIG="$(printf '%s' "$TYPE" | cut -d: -f2-)"
-    if [ -n "$DIG" ]; then
-      CFG_DIG="$(authcurl "https://ghcr.io/v2/versa-node/$REPO/manifests/$DIG" | python3 - <<'PY'
+    DIG="\${TYPE_AND_DIGEST#INDEX:}"
+    [ -z "$DIG" ] && { echo ""; exit 0; }
+    SUB_URL="https://ghcr.io/v2/versa-node/$REPO/manifests/$DIG"
+    SUB="$(authcurl "$SUB_URL" 2>/dev/null || true)"
+    [ -z "$SUB" ] && { echo ""; exit 0; }
+
+    SUB_ANN_DESC="$(python3 - <<'PY' <<< "$SUB"
 import sys, json
-m=json.load(sys.stdin)
+s=sys.stdin.read().strip()
+if not s: print(""); raise SystemExit(0)
+m=json.loads(s)
+ann=m.get("annotations") or {}
+print((ann.get("org.opencontainers.image.description") or "").strip())
+PY
+)"
+    if [ -n "$SUB_ANN_DESC" ]; then echo "$SUB_ANN_DESC"; exit 0; fi
+
+    CFG_DIG="$(python3 - <<'PY' <<< "$SUB"
+import sys, json
+s=sys.stdin.read().strip()
+if not s: print(""); raise SystemExit(0)
+m=json.loads(s)
 print((m.get("config") or {}).get("digest",""))
 PY
 )"
-    fi
     ;;
   MANIFEST:*)
-    CFG_DIG="$(printf '%s' "$TYPE" | cut -d: -f2-)"
+    CFG_DIG="\${TYPE_AND_DIGEST#MANIFEST:}"
     ;;
+  *)
+    echo ""; exit 0;;
 esac
 
 [ -n "$CFG_DIG" ] || { echo ""; exit 0; }
 
-authcurl "https://ghcr.io/v2/versa-node/$REPO/blobs/$CFG_DIG" | python3 - <<'PY'
+# 3) Config blob -> label
+CFG_URL="https://ghcr.io/v2/versa-node/$REPO/blobs/$CFG_DIG"
+CFG="$(authcurl "$CFG_URL" 2>/dev/null || true)"
+if [ -z "$CFG" ]; then echo ""; exit 0; fi
+
+python3 - <<'PY' <<< "$CFG"
 import sys, json
-cfg=json.load(sys.stdin)
+s=sys.stdin.read().strip()
+if not s: print(""); raise SystemExit(0)
+cfg=json.loads(s)
 labels=(cfg.get("config") or {}).get("Labels") or {}
 print((labels.get("org.opencontainers.image.description","") or "").strip())
 PY
@@ -310,7 +319,7 @@ PY
   try {
     const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
     const desc = (out || "").trim();
-    console.debug("[GHCR] label description", `${repo}:${tag}`, "=>", desc ? desc.substring(0, 80) + (desc.length > 80 ? "…": "") : "<empty>");
+    console.debug("[GHCR] description", `${repo}:${tag}`, "=>", desc ? desc.substring(0, 80) + (desc.length > 80 ? "…" : "") : "<empty>");
     return desc;
   } catch (e) {
     console.warn("[GHCR] fetchGhcrOciDescriptionViaSpawn failed:", e?.message || e);
@@ -320,29 +329,28 @@ PY
 
 export const ImageSearchModal = ({ downloadImage }) => {
   const [searchInProgress, setSearchInProgress] = useState(false);
-  const [searchFinished, setSearchFinished] = useState(false);
-  const [imageIdentifier, setImageIdentifier] = useState('');
-  const [imageList, setImageList] = useState([]);
-  const [selectedRegistry, setSelectedRegistry] = useState("ghcr.io"); // default to ghcr
-  const [selected, setSelected] = useState("");
-  const [dialogError, setDialogError] = useState("");
+  const [searchFinished,    setSearchFinished]    = useState(false);
+  const [imageIdentifier,   setImageIdentifier]   = useState('');
+  const [imageList,         setImageList]         = useState([]);
+  const [selectedRegistry,  setSelectedRegistry]  = useState("ghcr.io");
+  const [selected,          setSelected]          = useState("");
+  const [dialogError,       setDialogError]       = useState("");
   const [dialogErrorDetail, setDialogErrorDetail] = useState("");
-  const [typingTimeout, setTypingTimeout] = useState(null);
-  const [ghcrOrgListing, setGhcrOrgListing] = useState(false); // show results even with empty input
+  const [typingTimeout,     setTypingTimeout]     = useState(null);
+  const [ghcrOrgListing,    setGhcrOrgListing]    = useState(false);
 
   // Tag handling
-  const [tagOptions, setTagOptions] = useState([]);
-  const [tagLoading, setTagLoading] = useState(false);
-  const [tagError, setTagError] = useState("");
+  const [tagOptions,  setTagOptions]  = useState([]);
+  const [tagLoading,  setTagLoading]  = useState(false);
+  const [tagError,    setTagError]    = useState("");
   const [selectedTag, setSelectedTag] = useState("latest");
-  const [customTag, setCustomTag] = useState("");
+  const [customTag,   setCustomTag]   = useState("");
 
   const activeConnectionRef = useRef(null);
 
   const { registries } = useDockerInfo();
   const Dialogs = useDialogs();
 
-  // Registries to use for searching; ensure ghcr.io is present
   const baseRegistries =
     (registries?.search && registries.search.length !== 0)
       ? registries.search
@@ -357,7 +365,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
     }
   };
 
-  // On first open, list org packages if ghcr selected and empty query
+  // Initial org listing if GHCR & empty query
   useEffect(() => {
     if (selectedRegistry === "ghcr.io" && imageIdentifier.trim() === "") {
       onSearchTriggered("ghcr.io", true);
@@ -365,7 +373,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // If switching to ghcr with empty query, list org packages
+  // Switch to GHCR with empty query => list org packages
   useEffect(() => {
     if (selectedRegistry === "ghcr.io" && imageIdentifier.trim() === "") {
       onSearchTriggered("ghcr.io", true);
@@ -373,7 +381,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedRegistry]);
 
-  // If clearing query while on ghcr, re-list org packages
+  // Clearing query while GHCR => list org packages
   useEffect(() => {
     if (selectedRegistry === "ghcr.io" && imageIdentifier.trim() === "") {
       onSearchTriggered("ghcr.io", true);
@@ -381,7 +389,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [imageIdentifier]);
 
-  // Whenever selection changes, fetch tags + description for GHCR images
+  // On selection change, fetch tags and description
   useEffect(() => {
     const idx = (selected || "") === "" ? -1 : parseInt(selected, 10);
     if (Number.isNaN(idx) || idx < 0 || idx >= imageList.length) return;
@@ -399,7 +407,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
     console.debug("[UI] Selected index:", idx, "image:", img.name);
 
     if (isVersaNodeGhcr) {
-      // Fetch tags
+      // Tags
       (async () => {
         setTagLoading(true);
         try {
@@ -416,7 +424,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
         }
       })();
 
-      // Fetch description label for the chosen/default tag and update that row
+      // Description (index/manifest annotations -> config label)
       (async () => {
         const tag = selectedTag || "latest";
         const desc = await fetchGhcrOciDescriptionViaSpawn(img.name, tag);
@@ -429,15 +437,14 @@ export const ImageSearchModal = ({ downloadImage }) => {
             return next;
           });
         } else {
-          // keep whatever GH package description was already present
-          console.debug("[GHCR] No OCI description for", img.name, "— keeping package description");
+          console.debug("[Desc] empty for", img.name);
         }
       })();
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected]);
 
-  // If the selected tag changes (and an item is selected), refresh the description to that tag
+  // If tag changes, refresh description for selected item
   useEffect(() => {
     const idx = (selected || "") === "" ? -1 : parseInt(selected, 10);
     if (Number.isNaN(idx) || idx < 0 || idx >= imageList.length) return;
@@ -463,7 +470,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedTag]);
 
-  // Enrich a GHCR org listing with label descriptions (latest) progressively
+  // Enrich GHCR org list items with descriptions (progressively)
   async function enrichListWithDescriptions(list) {
     const out = [...list];
     for (let i = 0; i < out.length; i++) {
@@ -473,7 +480,6 @@ export const ImageSearchModal = ({ downloadImage }) => {
           const desc = await fetchGhcrOciDescriptionViaSpawn(row.name, "latest");
           if (desc) {
             out[i] = { ...row, description: desc };
-            // Update UI incrementally so user sees descriptions fill in
             setImageList((prev) => {
               const next = [...prev];
               if (next[i] && next[i].name === row.name) {
@@ -502,7 +508,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
 
     console.debug("[UI] Search triggered:", { searchRegistry, targetGhcr, typedRepo, forceSearch, imageIdentifier });
 
-    // If GHCR targeted and no specific repo typed yet, try listing org packages
+    // GHCR org listing
     if (targetGhcr && typedRepo.length === 0) {
       setDialogError(""); setDialogErrorDetail("");
       setSearchInProgress(true);
@@ -511,7 +517,6 @@ export const ImageSearchModal = ({ downloadImage }) => {
         const pkgs = await fetchGhcrOrgPackagesViaSpawn();
         setImageList(pkgs);
         setSelected(pkgs.length ? "0" : "");
-        // Enrich with descriptions progressively (registry label only)
         enrichListWithDescriptions(pkgs).catch(() => {});
       } finally {
         setSearchInProgress(false);
@@ -521,7 +526,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
       return;
     }
 
-    // If user typed a specific versa-node repo, synthesize the full name
+    // Specific versa-node repo typed
     if (targetGhcr) {
       const fullName = buildGhcrVersaNodeName(imageIdentifier);
       const bareNamespace = GHCR_NAMESPACE.replace(/\/+$/, "");
@@ -532,7 +537,6 @@ export const ImageSearchModal = ({ downloadImage }) => {
         const row = { name: fullName, description: "" };
         setImageList([row]);
         setSelected("0");
-        // Try to get label
         (async () => {
           const desc = await fetchGhcrOciDescriptionViaSpawn(fullName, "latest");
           if (desc) setImageList([{ name: fullName, description: desc }]);
@@ -559,13 +563,8 @@ export const ImageSearchModal = ({ downloadImage }) => {
     activeConnectionRef.current = rest.connect(client.getAddress());
 
     let queryRegistries = baseRegistries;
-    if (searchRegistry !== "") {
-      queryRegistries = [searchRegistry];
-    }
-
-    if (imageIdentifier.includes('/')) {
-      queryRegistries = [""];
-    }
+    if (searchRegistry !== "") queryRegistries = [searchRegistry];
+    if (imageIdentifier.includes('/')) queryRegistries = [""];
 
     const searches = (queryRegistries || []).map(rr => {
       const registry = rr.length < 1 || rr[rr.length - 1] === "/" ? rr : rr + "/";
@@ -583,8 +582,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
         let results = [];
         for (const result of reply) {
           if (result.status === "fulfilled") {
-            const parsed = JSON.parse(result.value);
-            results = results.concat(parsed);
+            results = results.concat(JSON.parse(result.value));
           } else {
             setDialogError(_("Failed to search for new images"));
             setDialogErrorDetail(result.reason
@@ -593,7 +591,6 @@ export const ImageSearchModal = ({ downloadImage }) => {
           }
         }
         console.debug("[Search] results:", results.length);
-        // Normalize description key (some registries use Description)
         const normalized = (results || []).map(r => ({
           ...r,
           description: (r.description || r.Description || "").trim(),
@@ -670,7 +667,6 @@ export const ImageSearchModal = ({ downloadImage }) => {
         </FormGroup>
       );
     }
-    // No tags available or non-GHCR registry: free text
     return (
       <FormGroup fieldId="image-search-tag-text" label={_("Tag")}>
         <TextInput
@@ -749,7 +745,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
         </Flex>
       </Form>
 
-      {searchInProgress && <EmptyStatePanel loading title={_("Searching...")} /> }
+      {searchInProgress && <EmptyStatePanel loading title={_("Searching...")} />}
 
       {!searchInProgress && !searchFinished && !ghcrOrgListing && imageIdentifier.trim() === "" && (
         <EmptyStatePanel
