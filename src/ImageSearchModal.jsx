@@ -197,7 +197,7 @@ fi
   }
 }
 
-// -------------------- DESCRIPTION (robust: validates JSON before parsing) --------------------
+// -------------------- DESCRIPTION (SIGPIPE-safe, tempfiles, single- or multi-arch) --------------------
 async function fetchGhcrOciDescriptionViaSpawn(fullName, tagIn) {
   const repo = parseGhcrRepoName(fullName);
   let tag = (tagIn || "latest").trim();
@@ -226,110 +226,120 @@ authcurl() {
   fi
 }
 
-is_json() {
-  # quick guard: non-empty and starts with { or [
-  [ -n "$1" ] && printf '%s' "$1" | head -c1 | grep -qE '^[{[]'
+# -- helpers that avoid pipelines (no SIGPIPE) --
+json_is_valid_file() {
+  # $1=path
+  [ -s "$1" ] || return 1
+  python3 - "$1" <<'PY' || exit 1
+import json,sys
+p=sys.argv[1]
+try:
+    with open(p,'r',encoding='utf-8',errors='strict') as f:
+        json.load(f)
+    print("ok")
+except Exception:
+    sys.exit(1)
+PY
+  >/dev/null 2>&1
 }
 
-json_get_media_type() {
-  printf '%s' "$1" | python3 - <<'PY'
+json_field_from_file() {
+  # $1=path, $2=python snippet to print a field
+  python3 - "$1" <<'PY'
 import json,sys
-try:
-    m=json.loads(sys.stdin.read() or "")
-    print(m.get("mediaType",""))
-except Exception:
-    print("")
+p=sys.argv[1]
+with open(p,'r',encoding='utf-8') as f:
+    m=json.load(f)
+print(m.get("mediaType",""))
 PY
 }
 
-cfg_from_manifest() {
-  printf '%s' "$1" | python3 - <<'PY'
+cfg_digest_from_manifest_file() {
+  python3 - "$1" <<'PY'
 import json,sys
-try:
-    m=json.loads(sys.stdin.read() or "")
-    print((m.get("config") or {}).get("digest",""))
-except Exception:
-    print("")
+p=sys.argv[1]
+m=json.load(open(p,'r',encoding='utf-8'))
+print((m.get("config") or {}).get("digest",""))
 PY
 }
 
-select_digest_from_index_pref_arm64() {
-  printf '%s' "$1" | python3 - <<'PY'
+select_manifest_digest_from_index_file() {
+  python3 - "$1" <<'PY'
 import json,sys
-try:
-    m=json.loads(sys.stdin.read() or "")
-    mans=m.get("manifests") or []
-    chosen=None
-    for e in mans:
-        p=(e or {}).get("platform") or {}
-        if p.get("os")=="linux" and p.get("architecture")=="arm64":
-            chosen=e; break
-    if not chosen and mans:
-        chosen=mans[0]
-    print((chosen or {}).get("digest","") or "")
-except Exception:
-    print("")
+p=sys.argv[1]
+m=json.load(open(p,'r',encoding='utf-8'))
+mans=m.get("manifests") or []
+chosen=None
+for e in mans:
+    p=e.get("platform") or {}
+    if p.get("os")=="linux" and p.get("architecture")=="arm64":
+        chosen=e; break
+if not chosen and mans:
+    chosen=mans[0]
+print((chosen or {}).get("digest","") or "")
 PY
 }
 
-desc_from_cfg() {
-  printf '%s' "$1" | python3 - <<'PY'
+desc_from_config_file() {
+  python3 - "$1" <<'PY'
 import json,sys
-try:
-    cfg=json.loads(sys.stdin.read() or "")
-    labels=(cfg.get("config") or {}).get("Labels") or {}
-    print((labels.get("org.opencontainers.image.description","") or "").strip())
-except Exception:
-    print("")
+p=sys.argv[1]
+cfg=json.load(open(p,'r',encoding='utf-8'))
+labels=(cfg.get("config") or {}).get("Labels") or {}
+print((labels.get("org.opencontainers.image.description","") or "").strip())
 PY
 }
 
-# 1) Top-level manifest (could be single manifest or index)
+# temp files
+MAN_FILE="$(mktemp)"; SUB_FILE="$(mktemp)"; CFG_FILE="$(mktemp)"
+cleanup() { rm -f "$MAN_FILE" "$SUB_FILE" "$CFG_FILE"; }
+trap cleanup EXIT
+
+# 1) top-level manifest
 MAN_URL="https://ghcr.io/v2/versa-node/$REPO/manifests/$TAG"
-MAN="$(authcurl "$MAN_URL" "$ACPT_MAN" 2>/dev/null || true)"
-if ! is_json "$MAN"; then
-  echo ""; exit 0
-fi
+authcurl "$MAN_URL" "$ACPT_MAN" >"$MAN_FILE" || true
+json_is_valid_file "$MAN_FILE" || { echo ""; exit 0; }
 
-TYPE="$(json_get_media_type "$MAN")"
+TYPE="$(python3 - "$MAN_FILE" <<'PY'
+import json,sys
+m=json.load(open(sys.argv[1],'r',encoding='utf-8'))
+print(m.get("mediaType",""))
+PY
+)"
 
 CFG_DIG=""
-if printf '%s' "$TYPE" | grep -qE 'image\.manifest|manifest\.v2'; then
-  CFG_DIG="$(cfg_from_manifest "$MAN")"
+if echo "$TYPE" | grep -qE 'image\.manifest|manifest\.v2'; then
+  CFG_DIG="$(cfg_digest_from_manifest_file "$MAN_FILE")"
 else
-  # Index: pick linux/arm64 if present; else first
-  SEL_DIG="$(select_digest_from_index_pref_arm64 "$MAN")"
-  [ -z "$SEL_DIG" ] && { echo ""; exit 0; }
+  SEL_DIG="$(select_manifest_digest_from_index_file "$MAN_FILE")"
+  [ -n "$SEL_DIG" ] || { echo ""; exit 0; }
   SUB_URL="https://ghcr.io/v2/versa-node/$REPO/manifests/$SEL_DIG"
-  SUB="$(authcurl "$SUB_URL" "$ACPT_MAN" 2>/dev/null || true)"
-  if ! is_json "$SUB"; then
-    echo ""; exit 0
-  fi
-  CFG_DIG="$(cfg_from_manifest "$SUB")"
+  authcurl "$SUB_URL" "$ACPT_MAN" >"$SUB_FILE" || true
+  json_is_valid_file "$SUB_FILE" || { echo ""; exit 0; }
+  CFG_DIG="$(cfg_digest_from_manifest_file "$SUB_FILE")"
 fi
 
 [ -n "$CFG_DIG" ] || { echo ""; exit 0; }
 
-# 2) Config blob
+# 2) fetch config blob and read label
 CFG_URL="https://ghcr.io/v2/versa-node/$REPO/blobs/$CFG_DIG"
-CFG="$(authcurl "$CFG_URL" "$ACPT_CFG" 2>/dev/null || true)"
-if ! is_json "$CFG"; then
-  echo ""; exit 0
-fi
+authcurl "$CFG_URL" "$ACPT_CFG" >"$CFG_FILE" || true
+json_is_valid_file "$CFG_FILE" || { echo ""; exit 0; }
 
-desc_from_cfg "$CFG"
+desc_from_config_file "$CFG_FILE"
 `;
 
   try {
     const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
     const desc = (out || "").trim();
-    console.debug("[GHCR] description (robust)", `${repo}:${tag}`, "=>", desc ? desc.substring(0, 80) + (desc.length > 80 ? "…" : "") : "<empty>");
+    console.debug("[GHCR] description (sigpipe-safe)", `${repo}:${tag}`, "=>", desc ? desc.substring(0, 80) + (desc.length > 80 ? "…" : "") : "<empty>");
     return desc;
   } catch (e) {
-    console.warn("[GHCR] fetchGhcrOciDescriptionViaSpawn (robust) failed:", e?.message || e);
+    console.warn("[GHCR] fetchGhcrOciDescriptionViaSpawn (sigpipe-safe) failed:", e?.message || e, e);
     return "";
   }
 }
+
 
 
 
