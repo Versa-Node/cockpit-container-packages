@@ -204,10 +204,6 @@ async function fetchGhcrOciDescriptionViaSpawn(fullName, tagIn) {
   if (!repo) return "";
   if (!/^[A-Za-z0-9._-]+$/.test(tag)) tag = "latest";
 
-  // prefer arm64 since your workflow builds arm64 single-arch images
-  const TARGET_OS = "linux";
-  const TARGET_ARCH = "arm64";
-
   const token = await ghcrGetRegistryTokenViaSpawn(repo);
 
   const script = `
@@ -218,7 +214,7 @@ TAG="${tag}"
 TOKEN="${token || ""}"
 
 UA="User-Agent: versanode-cockpit/1.0"
-# Order Accept so we try single-manifest first, then index types
+# Prefer single-manifest first; fall back to index types
 ACPT="Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json"
 
 authcurl() {
@@ -234,7 +230,8 @@ MAN_URL="https://ghcr.io/v2/versa-node/$REPO/manifests/$TAG"
 MAN="$(authcurl "$MAN_URL" 2>/dev/null || true)"
 [ -z "$MAN" ] && { echo ""; exit 0; }
 
-TYPE="$(python3 - <<'PY' <<<'$MAN'
+# Determine mediaType
+TYPE="$(printf '%s' "$MAN" | python3 - <<'PY'
 import json,sys
 m=json.loads(sys.stdin.read())
 print(m.get("mediaType",""))
@@ -243,16 +240,16 @@ PY
 
 # Helper: extract config digest from a single image manifest
 cfg_from_manifest() {
-  python3 - <<'PY' <<<'$1'
+  printf '%s' "$1" | python3 - <<'PY'
 import json,sys
 m=json.loads(sys.stdin.read())
 print((m.get("config") or {}).get("digest",""))
 PY
 }
 
-# Helper: last-resort config label read
+# Helper: read description label from a config blob
 desc_from_cfg() {
-  python3 - <<'PY' <<<'$1'
+  printf '%s' "$1" | python3 - <<'PY'
 import json,sys
 cfg=json.loads(sys.stdin.read())
 labels=(cfg.get("config") or {}).get("Labels") or {}
@@ -264,12 +261,11 @@ CFG_DIG=""
 if printf '%s' "$TYPE" | grep -qE 'image\.manifest|manifest\.v2'; then
   CFG_DIG="$(cfg_from_manifest "$MAN")"
 else
-  # It's an index: select linux/arm64 if present; else first entry
-  SEL_DIG="$(python3 - <<'PY' <<<'$MAN'
+  # It's an index: prefer linux/arm64, else first entry
+  SEL_DIG="$(printf '%s' "$MAN" | python3 - <<'PY'
 import json,sys
 m=json.loads(sys.stdin.read())
 mans=m.get("manifests") or []
-# prefer linux/arm64 (your single-arch build), else first manifest
 chosen=None
 for e in mans:
     p=e.get("platform") or {}
@@ -300,13 +296,14 @@ desc_from_cfg "$CFG"
   try {
     const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
     const desc = (out || "").trim();
-    console.debug("[GHCR] single-arch description", `${repo}:${tag}`, "=>", desc ? desc.substring(0, 80) + (desc.length > 80 ? "…" : "") : "<empty>");
+    console.debug("[GHCR] description", `${repo}:${tag}`, "=>", desc ? desc.substring(0, 80) + (desc.length > 80 ? "…" : "") : "<empty>");
     return desc;
   } catch (e) {
     console.warn("[GHCR] fetchGhcrOciDescriptionViaSpawn (single-arch) failed:", e?.message || e);
     return "";
   }
 }
+
 
 export const ImageSearchModal = ({ downloadImage }) => {
   const [searchInProgress, setSearchInProgress] = useState(false);
