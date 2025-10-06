@@ -45,9 +45,25 @@ const parseGhcrRepoName = (full) => {
   return noTag.replace(/^ghcr\.io\/?versa-node\/?/i, "").replace(/^\/+/, "");
 };
 
+// -------------------- SIMPLE IN-MEMORY CACHES --------------------
+// (module-level -> persists across component mounts in the same session)
+const ghcrOrgCache = { list: null, at: 0 }; // {list: [{name, description}], at: ts}
+const descCache = new Map(); // key: `${name}@${tag}` -> description
+const tagsCache = new Map(); // key: repo -> [tags]
+const tokenCache = new Map(); // key: repo -> token (string)
+
+// cache helpers
+const now = () => Date.now();
+const MIN = 60 * 1000;
+const isFresh = (ts, maxAgeMs) => ts && (now() - ts) < maxAgeMs;
+
 // -------------------- ORG LIST (GitHub Packages REST) --------------------
 // If token file is missing or not permitted, return an empty list silently.
-async function fetchGhcrOrgPackagesViaSpawn() {
+async function fetchGhcrOrgPackagesViaSpawn({ bypassCache = false } = {}) {
+  if (!bypassCache && ghcrOrgCache.list && isFresh(ghcrOrgCache.at, 10 * MIN)) {
+    return ghcrOrgCache.list;
+  }
+
   const script = `
 set -euo pipefail
 URL="https://api.github.com/orgs/${GH_ORG}/packages?package_type=container&per_page=100"
@@ -82,11 +98,14 @@ fi
   try {
     const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
     const pkgs = JSON.parse(out || "[]");
-    console.debug("[GHCR] Org packages fetched:", pkgs.length);
-    return (pkgs || []).map(p => ({
+    const normalized = (pkgs || []).map(p => ({
       name: `ghcr.io/versa-node/${p.name}`,
-      description: (p.description || "").trim(),  // GitHub package description (may be empty)
+      description: (p.description || "").trim(),  // fallback (GitHub package description)
     }));
+    ghcrOrgCache.list = normalized;
+    ghcrOrgCache.at = now();
+    console.debug("[GHCR] Org packages fetched:", normalized.length);
+    return normalized;
   } catch (e) {
     console.warn("[GHCR] fetchGhcrOrgPackagesViaSpawn failed:", e?.message || e);
     return [];
@@ -94,7 +113,9 @@ fi
 }
 
 // -------------------- TOKEN (Registry v2) --------------------
-async function ghcrGetRegistryTokenViaSpawn(repo) {
+async function ghcrGetRegistryTokenViaSpawn(repo, { bypassCache = false } = {}) {
+  if (!bypassCache && tokenCache.has(repo)) return tokenCache.get(repo) || "";
+
   const script = `
 set -euo pipefail
 
@@ -149,21 +170,28 @@ echo ""
 `;
   try {
     const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
-    if (!out) return "";
+    if (!out) {
+      tokenCache.set(repo, "");
+      return "";
+    }
     const token = (JSON.parse(out).token || "").trim();
+    tokenCache.set(repo, token);
     console.debug("[GHCR] token acquired for", repo, "?", Boolean(token));
     return token;
   } catch (e) {
     console.warn("[GHCR] ghcrGetRegistryTokenViaSpawn failed:", e?.message || e);
+    tokenCache.set(repo, "");
     return "";
   }
 }
 
 // -------------------- TAGS (Registry v2) --------------------
-async function fetchGhcrTagsViaSpawn(fullName) {
+async function fetchGhcrTagsViaSpawn(fullName, { bypassCache = false } = {}) {
   const repo = parseGhcrRepoName(fullName);
   if (!repo) return [];
-  const token = await ghcrGetRegistryTokenViaSpawn(repo);
+  if (!bypassCache && tagsCache.has(repo)) return tagsCache.get(repo) || [];
+
+  const token = await ghcrGetRegistryTokenViaSpawn(repo, { bypassCache });
 
   // DO NOT nest backticks inside this template string
   const script = `
@@ -189,6 +217,7 @@ fi
       if (b === 'latest') return 1;
       return b.localeCompare(a, undefined, { numeric: true, sensitivity: 'base' });
     });
+    tagsCache.set(repo, uniq);
     console.debug("[GHCR] tags:", repo, "=>", uniq.slice(0, 10), uniq.length > 10 ? `(+${uniq.length - 10})` : "");
     return uniq;
   } catch (e) {
@@ -198,13 +227,16 @@ fi
 }
 
 // -------------------- DESCRIPTION (SIGPIPE-safe, tempfiles, single- or multi-arch) --------------------
-async function fetchGhcrOciDescriptionViaSpawn(fullName, tagIn) {
+async function fetchGhcrOciDescriptionViaSpawn(fullName, tagIn, { bypassCache = false } = {}) {
   const repo = parseGhcrRepoName(fullName);
   let tag = (tagIn || "latest").trim();
   if (!repo) return "";
   if (!/^[A-Za-z0-9._-]+$/.test(tag)) tag = "latest";
 
-  const token = await ghcrGetRegistryTokenViaSpawn(repo);
+  const cacheKey = `${fullName}@${tag}`;
+  if (!bypassCache && descCache.has(cacheKey)) return descCache.get(cacheKey) || "";
+
+  const token = await ghcrGetRegistryTokenViaSpawn(repo, { bypassCache });
 
   const script = `
 set -euo pipefail
@@ -230,27 +262,11 @@ authcurl() {
 json_is_valid_file() {
   # $1=path
   [ -s "$1" ] || return 1
-  python3 - "$1" <<'PY' || exit 1
+  python3 - "$1" >/dev/null 2>&1 <<'PY'
 import json,sys
 p=sys.argv[1]
-try:
-    with open(p,'r',encoding='utf-8',errors='strict') as f:
-        json.load(f)
-    print("ok")
-except Exception:
-    sys.exit(1)
-PY
-  >/dev/null 2>&1
-}
-
-json_field_from_file() {
-  # $1=path, $2=python snippet to print a field
-  python3 - "$1" <<'PY'
-import json,sys
-p=sys.argv[1]
-with open(p,'r',encoding='utf-8') as f:
-    m=json.load(f)
-print(m.get("mediaType",""))
+with open(p,'r',encoding='utf-8',errors='strict') as f:
+    json.load(f)
 PY
 }
 
@@ -280,6 +296,15 @@ print((chosen or {}).get("digest","") or "")
 PY
 }
 
+media_type_from_file() {
+  python3 - "$1" <<'PY'
+import json,sys
+p=sys.argv[1]
+m=json.load(open(p,'r',encoding='utf-8'))
+print(m.get("mediaType",""))
+PY
+}
+
 desc_from_config_file() {
   python3 - "$1" <<'PY'
 import json,sys
@@ -300,12 +325,7 @@ MAN_URL="https://ghcr.io/v2/versa-node/$REPO/manifests/$TAG"
 authcurl "$MAN_URL" "$ACPT_MAN" >"$MAN_FILE" || true
 json_is_valid_file "$MAN_FILE" || { echo ""; exit 0; }
 
-TYPE="$(python3 - "$MAN_FILE" <<'PY'
-import json,sys
-m=json.load(open(sys.argv[1],'r',encoding='utf-8'))
-print(m.get("mediaType",""))
-PY
-)"
+TYPE="$(media_type_from_file "$MAN_FILE")"
 
 CFG_DIG=""
 if echo "$TYPE" | grep -qE 'image\.manifest|manifest\.v2'; then
@@ -332,16 +352,15 @@ desc_from_config_file "$CFG_FILE"
   try {
     const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
     const desc = (out || "").trim();
-    console.debug("[GHCR] description (sigpipe-safe)", `${repo}:${tag}`, "=>", desc ? desc.substring(0, 80) + (desc.length > 80 ? "…" : "") : "<empty>");
+    descCache.set(cacheKey, desc);
+    console.debug("[GHCR] description (cached)", `${repo}:${tag}`, "=>", desc ? desc.substring(0, 80) + (desc.length > 80 ? "…" : "") : "<empty>");
     return desc;
   } catch (e) {
     console.warn("[GHCR] fetchGhcrOciDescriptionViaSpawn (sigpipe-safe) failed:", e?.message || e, e);
+    descCache.set(cacheKey, "");
     return "";
   }
 }
-
-
-
 
 export const ImageSearchModal = ({ downloadImage }) => {
   const [searchInProgress, setSearchInProgress] = useState(false);
@@ -354,6 +373,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
   const [dialogErrorDetail, setDialogErrorDetail] = useState("");
   const [typingTimeout,     setTypingTimeout]     = useState(null);
   const [ghcrOrgListing,    setGhcrOrgListing]    = useState(false);
+  const [reloadNonce,       setReloadNonce]       = useState(0); // bump to force reload/bypass cache
 
   // Tag handling
   const [tagOptions,  setTagOptions]  = useState([]);
@@ -384,7 +404,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
   // Initial org listing if GHCR & empty query
   useEffect(() => {
     if (selectedRegistry === "ghcr.io" && imageIdentifier.trim() === "") {
-      onSearchTriggered("ghcr.io", true);
+      onSearchTriggered("ghcr.io", true, { bypassCache: false });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -392,7 +412,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
   // Switch to GHCR with empty query => list org packages
   useEffect(() => {
     if (selectedRegistry === "ghcr.io" && imageIdentifier.trim() === "") {
-      onSearchTriggered("ghcr.io", true);
+      onSearchTriggered("ghcr.io", true, { bypassCache: false });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedRegistry]);
@@ -400,7 +420,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
   // Clearing query while GHCR => list org packages
   useEffect(() => {
     if (selectedRegistry === "ghcr.io" && imageIdentifier.trim() === "") {
-      onSearchTriggered("ghcr.io", true);
+      onSearchTriggered("ghcr.io", true, { bypassCache: false });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [imageIdentifier]);
@@ -423,11 +443,11 @@ export const ImageSearchModal = ({ downloadImage }) => {
     console.debug("[UI] Selected index:", idx, "image:", img.name);
 
     if (isVersaNodeGhcr) {
-      // Tags
+      // Tags (use cache)
       (async () => {
         setTagLoading(true);
         try {
-          const tags = await fetchGhcrTagsViaSpawn(img.name);
+          const tags = await fetchGhcrTagsViaSpawn(img.name, { bypassCache: false });
           setTagOptions(tags);
           if (tags.length > 0) {
             setSelectedTag(tags.includes("latest") ? "latest" : tags[0]);
@@ -440,10 +460,10 @@ export const ImageSearchModal = ({ downloadImage }) => {
         }
       })();
 
-      // Description (index/manifest annotations -> config label)
+      // Description for currently selected (respect tag)
       (async () => {
         const tag = selectedTag || "latest";
-        const desc = await fetchGhcrOciDescriptionViaSpawn(img.name, tag);
+        const desc = await fetchGhcrOciDescriptionViaSpawn(img.name, tag, { bypassCache: false });
         if (desc) {
           setImageList((prev) => {
             const next = [...prev];
@@ -452,13 +472,11 @@ export const ImageSearchModal = ({ downloadImage }) => {
             }
             return next;
           });
-        } else {
-          console.debug("[Desc] empty for", img.name);
         }
       })();
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selected]);
+  }, [selected, reloadNonce]);
 
   // If tag changes, refresh description for selected item
   useEffect(() => {
@@ -472,7 +490,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
     (async () => {
       const tag = selectedTag || "latest";
       console.debug("[UI] Tag changed for", img.name, "->", tag);
-      const desc = await fetchGhcrOciDescriptionViaSpawn(img.name, tag);
+      const desc = await fetchGhcrOciDescriptionViaSpawn(img.name, tag, { bypassCache: false });
       if (desc) {
         setImageList((prev) => {
           const next = [...prev];
@@ -486,34 +504,34 @@ export const ImageSearchModal = ({ downloadImage }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedTag]);
 
-  // Enrich GHCR org list items with descriptions (progressively)
-  async function enrichListWithDescriptions(list) {
+  // Enrich GHCR org list items with descriptions (batch + cache)
+  async function enrichListWithDescriptions(list, { bypassCache = false } = {}) {
     const out = [...list];
-    for (let i = 0; i < out.length; i++) {
-      const row = out[i];
-      if (/^ghcr\.io\/versa-node\//i.test(row.name)) {
-        try {
-          const desc = await fetchGhcrOciDescriptionViaSpawn(row.name, "latest");
-          if (desc) {
-            out[i] = { ...row, description: desc };
-            setImageList((prev) => {
-              const next = [...prev];
-              if (next[i] && next[i].name === row.name) {
-                next[i] = { ...next[i], description: desc };
-              }
-              return next;
-            });
-            console.debug("[Desc] enriched", row.name);
-          }
-        } catch (e) {
-          console.warn("[Desc] enrich failed for", row.name, e?.message || e);
-        }
-      }
-    }
+    const idxs = out
+      .map((row, i) => (/^ghcr\.io\/versa-node\//i.test(row.name) ? i : -1))
+      .filter(i => i >= 0);
+
+    if (idxs.length === 0) return out;
+
+    // fetch all descriptions in parallel (prefer 'latest')
+    const promises = idxs.map(i => {
+      const n = out[i].name;
+      return fetchGhcrOciDescriptionViaSpawn(n, "latest", { bypassCache })
+        .then(desc => desc || "")
+        .catch(() => "");
+    });
+
+    const descs = await Promise.all(promises);
+
+    descs.forEach((desc, k) => {
+      const i = idxs[k];
+      if (desc) out[i] = { ...out[i], description: desc };
+    });
+
     return out;
   }
 
-  const onSearchTriggered = async (searchRegistry = "", forceSearch = false) => {
+  const onSearchTriggered = async (searchRegistry = "", forceSearch = false, { bypassCache = false } = {}) => {
     setSearchFinished(false);
 
     const targetGhcr = isGhcr(searchRegistry) || isGhcrVersaNodeTerm(imageIdentifier);
@@ -522,7 +540,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
       .replace(/^versa-node\/?/i, "")
       .trim();
 
-    console.debug("[UI] Search triggered:", { searchRegistry, targetGhcr, typedRepo, forceSearch, imageIdentifier });
+    console.debug("[UI] Search triggered:", { searchRegistry, targetGhcr, typedRepo, forceSearch, imageIdentifier, bypassCache });
 
     // GHCR org listing
     if (targetGhcr && typedRepo.length === 0) {
@@ -530,10 +548,10 @@ export const ImageSearchModal = ({ downloadImage }) => {
       setSearchInProgress(true);
       setGhcrOrgListing(true);
       try {
-        const pkgs = await fetchGhcrOrgPackagesViaSpawn();
-        setImageList(pkgs);
-        setSelected(pkgs.length ? "0" : "");
-        enrichListWithDescriptions(pkgs).catch(() => {});
+        const pkgs = await fetchGhcrOrgPackagesViaSpawn({ bypassCache });
+        const enriched = await enrichListWithDescriptions(pkgs, { bypassCache });
+        setImageList(enriched);
+        setSelected(enriched.length ? "0" : "");
       } finally {
         setSearchInProgress(false);
         setSearchFinished(true);
@@ -551,10 +569,14 @@ export const ImageSearchModal = ({ downloadImage }) => {
         setSelected("");
       } else {
         const row = { name: fullName, description: "" };
-        setImageList([row]);
+        // try to hydrate description from cache immediately
+        const cachedDesc = descCache.get(`${fullName}@latest`) || "";
+        const initial = cachedDesc ? [{ name: fullName, description: cachedDesc }] : [row];
+        setImageList(initial);
         setSelected("0");
+        // background refresh (respects bypassCache flag)
         (async () => {
-          const desc = await fetchGhcrOciDescriptionViaSpawn(fullName, "latest");
+          const desc = await fetchGhcrOciDescriptionViaSpawn(fullName, "latest", { bypassCache });
           if (desc) setImageList([{ name: fullName, description: desc }]);
         })().catch(() => {});
       }
@@ -629,7 +651,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
       const forceSearch = e.key === 'Enter';
       if (forceSearch) e.preventDefault();
       clearTimeout(typingTimeout);
-      setTypingTimeout(setTimeout(() => onSearchTriggered(selectedRegistry, forceSearch), 250));
+      setTypingTimeout(setTimeout(() => onSearchTriggered(selectedRegistry, forceSearch, { bypassCache: false }), 250));
     }
   };
 
@@ -638,16 +660,41 @@ export const ImageSearchModal = ({ downloadImage }) => {
     const selectedImageName = imageList[selected].name;
     closeActiveConnection();
     Dialogs.close();
-    const tag = tagOptions.length > 0
+    const raw = tagOptions.length > 0
       ? (selectedTag || "latest")
       : ((customTag || "").trim() || "latest");
-    console.debug("[UI] Download clicked:", { image: selectedImageName, tag });
-    downloadImage(selectedImageName, tag);
+
+    // pass through digest syntax (@sha256:...)
+    const isDigest = /^@?sha256:[a-f0-9]{64}$/i.test(raw);
+    const tagOrDigest = isDigest ? (raw.startsWith('@') ? raw : '@' + raw) : raw;
+
+    console.debug("[UI] Download clicked:", { image: selectedImageName, tagOrDigest });
+    downloadImage(selectedImageName, tagOrDigest);
   };
 
   const handleClose = () => {
     closeActiveConnection();
     Dialogs.close();
+  };
+
+  const onReload = async () => {
+    // bypass cache: clear token/tags/desc for items we have and refresh
+    // (we don’t globally clear caches to keep other tabs fast)
+    const names = imageList.map(x => x?.name).filter(Boolean);
+    names.forEach(n => {
+      const repo = parseGhcrRepoName(n);
+      if (repo) {
+        tokenCache.delete(repo);
+        tagsCache.delete(repo);
+      }
+    });
+    // clear desc cache for displayed names (any tag)
+    Array.from(descCache.keys()).forEach(k => {
+      if (names.some(n => k.startsWith(n + "@"))) descCache.delete(k);
+    });
+
+    setReloadNonce(x => x + 1);
+    await onSearchTriggered(selectedRegistry, true, { bypassCache: true });
   };
 
   // Tag picker UI
@@ -715,6 +762,9 @@ export const ImageSearchModal = ({ downloadImage }) => {
           <Form isHorizontal className="image-search-tag-form">
             <TagPicker />
           </Form>
+          <Button variant="secondary" onClick={onReload}>
+            {_("Reload")}
+          </Button>
           <Button variant="primary" isDisabled={selected === ""} onClick={onDownloadClicked}>
             {_("Download")}
           </Button>
@@ -746,7 +796,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
                 console.debug("[UI] Registry changed:", value);
                 setSelectedRegistry(value);
                 clearTimeout(typingTimeout);
-                onSearchTriggered(value, false);
+                onSearchTriggered(value, false, { bypassCache: false });
               }}
             >
               {(mergedRegistries || []).map(r => (
