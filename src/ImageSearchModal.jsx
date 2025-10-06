@@ -197,12 +197,16 @@ fi
   }
 }
 
-// -------------------- DESCRIPTION (index/manifest annotations, then config label) --------------------
+// -------------------- DESCRIPTION (prefer single-arch manifest config label) --------------------
 async function fetchGhcrOciDescriptionViaSpawn(fullName, tagIn) {
   const repo = parseGhcrRepoName(fullName);
   let tag = (tagIn || "latest").trim();
   if (!repo) return "";
   if (!/^[A-Za-z0-9._-]+$/.test(tag)) tag = "latest";
+
+  // prefer arm64 since your workflow builds arm64 single-arch images
+  const TARGET_OS = "linux";
+  const TARGET_ARCH = "arm64";
 
   const token = await ghcrGetRegistryTokenViaSpawn(repo);
 
@@ -214,7 +218,8 @@ TAG="${tag}"
 TOKEN="${token || ""}"
 
 UA="User-Agent: versanode-cockpit/1.0"
-ACPT="Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
+# Order Accept so we try single-manifest first, then index types
+ACPT="Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json"
 
 authcurl() {
   if [ -n "$TOKEN" ]; then
@@ -224,105 +229,81 @@ authcurl() {
   fi
 }
 
-# 1) Top manifest
+# 1) Fetch the top manifest (may be single-manifest or index)
 MAN_URL="https://ghcr.io/v2/versa-node/$REPO/manifests/$TAG"
 MAN="$(authcurl "$MAN_URL" 2>/dev/null || true)"
-if [ -z "$MAN" ]; then echo ""; exit 0; fi
+[ -z "$MAN" ] && { echo ""; exit 0; }
 
-# 1a) Top-level annotations?
-TOP_ANN_DESC="$(python3 - <<'PY' <<< "$MAN"
-import sys, json
-s=sys.stdin.read().strip()
-if not s: print(""); raise SystemExit(0)
-m=json.loads(s)
-ann=m.get("annotations") or {}
-print((ann.get("org.opencontainers.image.description") or "").strip())
-PY
-)"
-if [ -n "$TOP_ANN_DESC" ]; then
-  echo "$TOP_ANN_DESC"; exit 0
-fi
-
-# 2) Decide path (index vs single manifest)
-TYPE_AND_DIGEST="$(python3 - <<'PY' <<< "$MAN"
-import sys, json
-s=sys.stdin.read().strip()
-if not s: print(""); raise SystemExit(0)
-m=json.loads(s)
-t=m.get("mediaType","")
-if "image.index" in t or "manifest.list" in t:
-    dig=None
-    for e in m.get("manifests",[]):
-        p=e.get("platform") or {}
-        if p.get("os")=="linux" and p.get("architecture")=="amd64":
-            dig=e.get("digest"); break
-    if not dig and m.get("manifests"):
-        dig=(m["manifests"][0] or {}).get("digest")
-    print("INDEX:"+ (dig or ""))
-else:
-    cfg=(m.get("config") or {})
-    print("MANIFEST:"+ (cfg.get("digest","")))
+TYPE="$(python3 - <<'PY' <<<'$MAN'
+import json,sys
+m=json.loads(sys.stdin.read())
+print(m.get("mediaType",""))
 PY
 )"
 
-case "$TYPE_AND_DIGEST" in
-  INDEX:*)
-    DIG="\${TYPE_AND_DIGEST#INDEX:}"
-    [ -z "$DIG" ] && { echo ""; exit 0; }
-    SUB_URL="https://ghcr.io/v2/versa-node/$REPO/manifests/$DIG"
-    SUB="$(authcurl "$SUB_URL" 2>/dev/null || true)"
-    [ -z "$SUB" ] && { echo ""; exit 0; }
-
-    SUB_ANN_DESC="$(python3 - <<'PY' <<< "$SUB"
-import sys, json
-s=sys.stdin.read().strip()
-if not s: print(""); raise SystemExit(0)
-m=json.loads(s)
-ann=m.get("annotations") or {}
-print((ann.get("org.opencontainers.image.description") or "").strip())
-PY
-)"
-    if [ -n "$SUB_ANN_DESC" ]; then echo "$SUB_ANN_DESC"; exit 0; fi
-
-    CFG_DIG="$(python3 - <<'PY' <<< "$SUB"
-import sys, json
-s=sys.stdin.read().strip()
-if not s: print(""); raise SystemExit(0)
-m=json.loads(s)
+# Helper: extract config digest from a single image manifest
+cfg_from_manifest() {
+  python3 - <<'PY' <<<'$1'
+import json,sys
+m=json.loads(sys.stdin.read())
 print((m.get("config") or {}).get("digest",""))
 PY
-)"
-    ;;
-  MANIFEST:*)
-    CFG_DIG="\${TYPE_AND_DIGEST#MANIFEST:}"
-    ;;
-  *)
-    echo ""; exit 0;;
-esac
+}
 
-[ -n "$CFG_DIG" ] || { echo ""; exit 0; }
-
-# 3) Config blob -> label
-CFG_URL="https://ghcr.io/v2/versa-node/$REPO/blobs/$CFG_DIG"
-CFG="$(authcurl "$CFG_URL" 2>/dev/null || true)"
-if [ -z "$CFG" ]; then echo ""; exit 0; fi
-
-python3 - <<'PY' <<< "$CFG"
-import sys, json
-s=sys.stdin.read().strip()
-if not s: print(""); raise SystemExit(0)
-cfg=json.loads(s)
+# Helper: last-resort config label read
+desc_from_cfg() {
+  python3 - <<'PY' <<<'$1'
+import json,sys
+cfg=json.loads(sys.stdin.read())
 labels=(cfg.get("config") or {}).get("Labels") or {}
 print((labels.get("org.opencontainers.image.description","") or "").strip())
 PY
+}
+
+CFG_DIG=""
+if printf '%s' "$TYPE" | grep -qE 'image\.manifest|manifest\.v2'; then
+  CFG_DIG="$(cfg_from_manifest "$MAN")"
+else
+  # It's an index: select linux/arm64 if present; else first entry
+  SEL_DIG="$(python3 - <<'PY' <<<'$MAN'
+import json,sys
+m=json.loads(sys.stdin.read())
+mans=m.get("manifests") or []
+# prefer linux/arm64 (your single-arch build), else first manifest
+chosen=None
+for e in mans:
+    p=e.get("platform") or {}
+    if p.get("os")=="linux" and p.get("architecture")=="arm64":
+        chosen=e; break
+if not chosen and mans:
+    chosen=mans[0]
+print((chosen or {}).get("digest","") or "")
+PY
+)"
+  [ -z "$SEL_DIG" ] && { echo ""; exit 0; }
+  SUB_URL="https://ghcr.io/v2/versa-node/$REPO/manifests/$SEL_DIG"
+  SUB="$(authcurl "$SUB_URL" 2>/dev/null || true)"
+  [ -z "$SUB" ] && { echo ""; exit 0; }
+  CFG_DIG="$(cfg_from_manifest "$SUB")"
+fi
+
+[ -n "$CFG_DIG" ] || { echo ""; exit 0; }
+
+# 2) Fetch config blob and read label
+CFG_URL="https://ghcr.io/v2/versa-node/$REPO/blobs/$CFG_DIG"
+CFG="$(authcurl "$CFG_URL" 2>/dev/null || true)"
+[ -z "$CFG" ] && { echo ""; exit 0; }
+
+desc_from_cfg "$CFG"
 `;
+
   try {
     const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
     const desc = (out || "").trim();
-    console.debug("[GHCR] description", `${repo}:${tag}`, "=>", desc ? desc.substring(0, 80) + (desc.length > 80 ? "…" : "") : "<empty>");
+    console.debug("[GHCR] single-arch description", `${repo}:${tag}`, "=>", desc ? desc.substring(0, 80) + (desc.length > 80 ? "…" : "") : "<empty>");
     return desc;
   } catch (e) {
-    console.warn("[GHCR] fetchGhcrOciDescriptionViaSpawn failed:", e?.message || e);
+    console.warn("[GHCR] fetchGhcrOciDescriptionViaSpawn (single-arch) failed:", e?.message || e);
     return "";
   }
 }
