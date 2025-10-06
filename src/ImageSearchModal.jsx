@@ -25,14 +25,20 @@ const GH_ORG = "versa-node";             // org is case-insensitive in API paths
 const GHCR_NAMESPACE = "ghcr.io/versa-node/";
 
 const isGhcr = (reg) => (reg || "").trim().toLowerCase() === "ghcr.io";
+const isGhcp = (reg) => (reg || "").trim().toLowerCase() === "ghcp.io"; // alias
 
 // user typed a GHCR versa-node reference? (either fully-qualified or org-prefixed)
 const isGhcrVersaNodeTerm = (term) =>
   /^ghcr\.io\/versa-node\/[^/]+/i.test(term || "") || /^versa-node\/[^/]+/i.test(term || "");
 
+// user typed a GHCP (alias) versa-node reference?
+const isGhcpVersaNodeTerm = (term) =>
+  /^ghcp\.io\/versa-node\/[^/]+/i.test(term || "");
+
 // turn free text into the final ghcr.io/versa-node/<name>
 const buildGhcrVersaNodeName = (txt) => {
   const t = (txt || "").trim()
+    .replace(/^ghcp\.io\/?/i, "")  // alias support
     .replace(/^ghcr\.io\/?/i, "")
     .replace(/^versa-node\/?/i, "");
   return (GHCR_NAMESPACE + t).replace(/\/+$/, "");
@@ -193,7 +199,6 @@ async function fetchGhcrTagsViaSpawn(fullName, { bypassCache = false } = {}) {
 
   const token = await ghcrGetRegistryTokenViaSpawn(repo, { bypassCache });
 
-  // DO NOT nest backticks inside this template string
   const script = `
 set -euo pipefail
 REPO="${repo}"
@@ -328,7 +333,7 @@ json_is_valid_file "$MAN_FILE" || { echo ""; exit 0; }
 TYPE="$(media_type_from_file "$MAN_FILE")"
 
 CFG_DIG=""
-if echo "$TYPE" | grep -qE 'image\.manifest|manifest\.v2'; then
+if echo "$TYPE" | grep -qE 'image\\.manifest|manifest\\.v2'; then
   CFG_DIG="$(cfg_digest_from_manifest_file "$MAN_FILE")"
 else
   SEL_DIG="$(select_manifest_digest_from_index_file "$MAN_FILE")"
@@ -392,7 +397,8 @@ export const ImageSearchModal = ({ downloadImage }) => {
       ? registries.search
       : fallbackRegistries;
 
-  const mergedRegistries = Array.from(new Set(["ghcr.io", ...(baseRegistries || [])]));
+  // include ghcp.io (alias) at the front for convenience
+  const mergedRegistries = Array.from(new Set(["ghcr.io", "ghcp.io", ...(baseRegistries || [])]));
 
   const closeActiveConnection = () => {
     if (activeConnectionRef.current) {
@@ -401,26 +407,26 @@ export const ImageSearchModal = ({ downloadImage }) => {
     }
   };
 
-  // Initial org listing if GHCR & empty query
+  // Initial org listing if GHCR/alias & empty query
   useEffect(() => {
-    if (selectedRegistry === "ghcr.io" && imageIdentifier.trim() === "") {
-      onSearchTriggered("ghcr.io", true, { bypassCache: false });
+    if ((isGhcr(selectedRegistry) || isGhcp(selectedRegistry)) && imageIdentifier.trim() === "") {
+      onSearchTriggered(selectedRegistry, true, { bypassCache: false });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Switch to GHCR with empty query => list org packages
+  // Switch to GHCR/alias with empty query => list org packages
   useEffect(() => {
-    if (selectedRegistry === "ghcr.io" && imageIdentifier.trim() === "") {
-      onSearchTriggered("ghcr.io", true, { bypassCache: false });
+    if ((isGhcr(selectedRegistry) || isGhcp(selectedRegistry)) && imageIdentifier.trim() === "") {
+      onSearchTriggered(selectedRegistry, true, { bypassCache: false });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedRegistry]);
 
-  // Clearing query while GHCR => list org packages
+  // Clearing query while GHCR/alias => list org packages
   useEffect(() => {
-    if (selectedRegistry === "ghcr.io" && imageIdentifier.trim() === "") {
-      onSearchTriggered("ghcr.io", true, { bypassCache: false });
+    if ((isGhcr(selectedRegistry) || isGhcp(selectedRegistry)) && imageIdentifier.trim() === "") {
+      onSearchTriggered(selectedRegistry, true, { bypassCache: false });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [imageIdentifier]);
@@ -534,55 +540,49 @@ export const ImageSearchModal = ({ downloadImage }) => {
   const onSearchTriggered = async (searchRegistry = "", forceSearch = false, { bypassCache = false } = {}) => {
     setSearchFinished(false);
 
-    const targetGhcr = isGhcr(searchRegistry) || isGhcrVersaNodeTerm(imageIdentifier);
+    const ghLikeRegistry = isGhcr(searchRegistry) || isGhcp(searchRegistry);
+    const targetGhLike = ghLikeRegistry
+      || isGhcrVersaNodeTerm(imageIdentifier)
+      || isGhcpVersaNodeTerm(imageIdentifier);
+
+    // Repo term derived from input; strip both ghcp.io and ghcr.io prefixes
     const typedRepo = imageIdentifier
+      .replace(/^ghcp\.io\/?versa-node\/?/i, "")
       .replace(/^ghcr\.io\/?versa-node\/?/i, "")
       .replace(/^versa-node\/?/i, "")
       .trim();
 
-    console.debug("[UI] Search triggered:", { searchRegistry, targetGhcr, typedRepo, forceSearch, imageIdentifier, bypassCache });
+    console.debug("[UI] Search triggered:", { searchRegistry, ghLikeRegistry, targetGhLike, typedRepo, forceSearch, imageIdentifier, bypassCache });
 
-    // GHCR org listing
-    if (targetGhcr && typedRepo.length === 0) {
+    // GH-like (ghcr.io or ghcp.io alias) behavior
+    if (targetGhLike) {
       setDialogError(""); setDialogErrorDetail("");
       setSearchInProgress(true);
       setGhcrOrgListing(true);
       try {
         const pkgs = await fetchGhcrOrgPackagesViaSpawn({ bypassCache });
-        const enriched = await enrichListWithDescriptions(pkgs, { bypassCache });
+        let working = pkgs;
+
+        // If using ghcp.io OR user typed a repo under ghcp/ghcr, filter locally
+        if (isGhcp(searchRegistry) || /^ghcp\.io\//i.test(imageIdentifier) || (typedRepo && isGhcp(selectedRegistry))) {
+          const q = typedRepo.toLowerCase();
+          working = pkgs.filter(p => {
+            const repo = p.name.replace(/^ghcr\.io\/?versa-node\/?/i, "");
+            return repo.toLowerCase().includes(q) || (p.description || "").toLowerCase().includes(q);
+          });
+        } else if (typedRepo.length && isGhcr(searchRegistry)) {
+          // For explicit ghcr.io selection with a repo text, show that single target
+          const fullName = buildGhcrVersaNodeName(imageIdentifier);
+          working = [{ name: fullName, description: "" }];
+        }
+
+        const enriched = await enrichListWithDescriptions(working, { bypassCache });
         setImageList(enriched);
         setSelected(enriched.length ? "0" : "");
       } finally {
         setSearchInProgress(false);
         setSearchFinished(true);
       }
-      closeActiveConnection();
-      return;
-    }
-
-    // Specific versa-node repo typed
-    if (targetGhcr) {
-      const fullName = buildGhcrVersaNodeName(imageIdentifier);
-      const bareNamespace = GHCR_NAMESPACE.replace(/\/+$/, "");
-      if (!fullName || fullName === bareNamespace) {
-        setImageList([]);
-        setSelected("");
-      } else {
-        const row = { name: fullName, description: "" };
-        // try to hydrate description from cache immediately
-        const cachedDesc = descCache.get(`${fullName}@latest`) || "";
-        const initial = cachedDesc ? [{ name: fullName, description: cachedDesc }] : [row];
-        setImageList(initial);
-        setSelected("0");
-        // background refresh (respects bypassCache flag)
-        (async () => {
-          const desc = await fetchGhcrOciDescriptionViaSpawn(fullName, "latest", { bypassCache });
-          if (desc) setImageList([{ name: fullName, description: desc }]);
-        })().catch(() => {});
-      }
-      setGhcrOrgListing(false);
-      setSearchInProgress(false);
-      setSearchFinished(true);
       closeActiveConnection();
       return;
     }
@@ -679,7 +679,6 @@ export const ImageSearchModal = ({ downloadImage }) => {
 
   const onReload = async () => {
     // bypass cache: clear token/tags/desc for items we have and refresh
-    // (we don’t globally clear caches to keep other tabs fast)
     const names = imageList.map(x => x?.name).filter(Boolean);
     names.forEach(n => {
       const repo = parseGhcrRepoName(n);
@@ -803,7 +802,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
                 <FormSelectOption
                   value={r}
                   key={r}
-                  label={r === "ghcr.io" ? "ghcr.io (versa-node)" : r}
+                  label={r === "ghcr.io" ? "ghcr.io (versa-node)" : (r === "ghcp.io" ? "ghcp.io (alias, filter)" : r)}
                 />
               ))}
             </FormSelect>
@@ -825,7 +824,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
           {imageList.length === 0 && (
             <EmptyStatePanel
               icon={ExclamationCircleIcon}
-              title={cockpit.format(_("No results for $0"), imageIdentifier || "GHCR")}
+              title={cockpit.format(_("No results for $0"), imageIdentifier || (isGhcp(selectedRegistry) ? "GHCP" : "GHCR"))}
               paragraph={_("Retry another term or switch registry.")}
             />
           )}
