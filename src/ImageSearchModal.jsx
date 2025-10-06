@@ -197,7 +197,7 @@ fi
   }
 }
 
-// -------------------- DESCRIPTION (prefer single-arch manifest config label) --------------------
+// -------------------- DESCRIPTION (robust: validates JSON before parsing) --------------------
 async function fetchGhcrOciDescriptionViaSpawn(fullName, tagIn) {
   const repo = parseGhcrRepoName(fullName);
   let tag = (tagIn || "latest").trim();
@@ -214,81 +214,108 @@ TAG="${tag}"
 TOKEN="${token || ""}"
 
 UA="User-Agent: versanode-cockpit/1.0"
-# Prefer single-manifest first; fall back to index types
-ACPT="Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json"
+ACPT_MAN="Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json"
+ACPT_CFG="Accept: application/vnd.oci.image.config.v1+json, application/vnd.docker.container.image.v1+json"
 
 authcurl() {
+  # $1=url, $2=acceptHeader
   if [ -n "$TOKEN" ]; then
-    curl -fsSL -H "$UA" -H "$ACPT" -H "Docker-Distribution-API-Version: registry/2.0" -H "Authorization: Bearer $TOKEN" "$1"
+    curl -fsSL -H "$UA" -H "$2" -H "Docker-Distribution-API-Version: registry/2.0" -H "Authorization: Bearer $TOKEN" "$1"
   else
-    curl -fsSL -H "$UA" -H "$ACPT" -H "Docker-Distribution-API-Version: registry/2.0" "$1"
+    curl -fsSL -H "$UA" -H "$2" -H "Docker-Distribution-API-Version: registry/2.0" "$1"
   fi
 }
 
-# 1) Fetch the top manifest (may be single-manifest or index)
-MAN_URL="https://ghcr.io/v2/versa-node/$REPO/manifests/$TAG"
-MAN="$(authcurl "$MAN_URL" 2>/dev/null || true)"
-[ -z "$MAN" ] && { echo ""; exit 0; }
+is_json() {
+  # quick guard: non-empty and starts with { or [
+  [ -n "$1" ] && printf '%s' "$1" | head -c1 | grep -qE '^[{[]'
+}
 
-# Determine mediaType
-TYPE="$(printf '%s' "$MAN" | python3 - <<'PY'
+json_get_media_type() {
+  printf '%s' "$1" | python3 - <<'PY'
 import json,sys
-m=json.loads(sys.stdin.read())
-print(m.get("mediaType",""))
+try:
+    m=json.loads(sys.stdin.read() or "")
+    print(m.get("mediaType",""))
+except Exception:
+    print("")
 PY
-)"
+}
 
-# Helper: extract config digest from a single image manifest
 cfg_from_manifest() {
   printf '%s' "$1" | python3 - <<'PY'
 import json,sys
-m=json.loads(sys.stdin.read())
-print((m.get("config") or {}).get("digest",""))
+try:
+    m=json.loads(sys.stdin.read() or "")
+    print((m.get("config") or {}).get("digest",""))
+except Exception:
+    print("")
 PY
 }
 
-# Helper: read description label from a config blob
+select_digest_from_index_pref_arm64() {
+  printf '%s' "$1" | python3 - <<'PY'
+import json,sys
+try:
+    m=json.loads(sys.stdin.read() or "")
+    mans=m.get("manifests") or []
+    chosen=None
+    for e in mans:
+        p=(e or {}).get("platform") or {}
+        if p.get("os")=="linux" and p.get("architecture")=="arm64":
+            chosen=e; break
+    if not chosen and mans:
+        chosen=mans[0]
+    print((chosen or {}).get("digest","") or "")
+except Exception:
+    print("")
+PY
+}
+
 desc_from_cfg() {
   printf '%s' "$1" | python3 - <<'PY'
 import json,sys
-cfg=json.loads(sys.stdin.read())
-labels=(cfg.get("config") or {}).get("Labels") or {}
-print((labels.get("org.opencontainers.image.description","") or "").strip())
+try:
+    cfg=json.loads(sys.stdin.read() or "")
+    labels=(cfg.get("config") or {}).get("Labels") or {}
+    print((labels.get("org.opencontainers.image.description","") or "").strip())
+except Exception:
+    print("")
 PY
 }
+
+# 1) Top-level manifest (could be single manifest or index)
+MAN_URL="https://ghcr.io/v2/versa-node/$REPO/manifests/$TAG"
+MAN="$(authcurl "$MAN_URL" "$ACPT_MAN" 2>/dev/null || true)"
+if ! is_json "$MAN"; then
+  echo ""; exit 0
+fi
+
+TYPE="$(json_get_media_type "$MAN")"
 
 CFG_DIG=""
 if printf '%s' "$TYPE" | grep -qE 'image\.manifest|manifest\.v2'; then
   CFG_DIG="$(cfg_from_manifest "$MAN")"
 else
-  # It's an index: prefer linux/arm64, else first entry
-  SEL_DIG="$(printf '%s' "$MAN" | python3 - <<'PY'
-import json,sys
-m=json.loads(sys.stdin.read())
-mans=m.get("manifests") or []
-chosen=None
-for e in mans:
-    p=e.get("platform") or {}
-    if p.get("os")=="linux" and p.get("architecture")=="arm64":
-        chosen=e; break
-if not chosen and mans:
-    chosen=mans[0]
-print((chosen or {}).get("digest","") or "")
-PY
-)"
+  # Index: pick linux/arm64 if present; else first
+  SEL_DIG="$(select_digest_from_index_pref_arm64 "$MAN")"
   [ -z "$SEL_DIG" ] && { echo ""; exit 0; }
   SUB_URL="https://ghcr.io/v2/versa-node/$REPO/manifests/$SEL_DIG"
-  SUB="$(authcurl "$SUB_URL" 2>/dev/null || true)"
-  [ -z "$SUB" ] && { echo ""; exit 0; }
+  SUB="$(authcurl "$SUB_URL" "$ACPT_MAN" 2>/dev/null || true)"
+  if ! is_json "$SUB"; then
+    echo ""; exit 0
+  fi
   CFG_DIG="$(cfg_from_manifest "$SUB")"
 fi
 
 [ -n "$CFG_DIG" ] || { echo ""; exit 0; }
 
-# 2) Fetch config blob and read label
+# 2) Config blob
 CFG_URL="https://ghcr.io/v2/versa-node/$REPO/blobs/$CFG_DIG"
-CFG="$(authcurl "$CFG_URL" 2>/dev/null || true)"
-[ -z "$CFG" ] && { echo ""; exit 0; }
+CFG="$(authcurl "$CFG_URL" "$ACPT_CFG" 2>/dev/null || true)"
+if ! is_json "$CFG"; then
+  echo ""; exit 0
+fi
 
 desc_from_cfg "$CFG"
 `;
@@ -296,13 +323,14 @@ desc_from_cfg "$CFG"
   try {
     const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
     const desc = (out || "").trim();
-    console.debug("[GHCR] description", `${repo}:${tag}`, "=>", desc ? desc.substring(0, 80) + (desc.length > 80 ? "…" : "") : "<empty>");
+    console.debug("[GHCR] description (robust)", `${repo}:${tag}`, "=>", desc ? desc.substring(0, 80) + (desc.length > 80 ? "…" : "") : "<empty>");
     return desc;
   } catch (e) {
-    console.warn("[GHCR] fetchGhcrOciDescriptionViaSpawn (single-arch) failed:", e?.message || e);
+    console.warn("[GHCR] fetchGhcrOciDescriptionViaSpawn (robust) failed:", e?.message || e);
     return "";
   }
 }
+
 
 
 export const ImageSearchModal = ({ downloadImage }) => {
