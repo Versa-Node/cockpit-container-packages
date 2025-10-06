@@ -1,13 +1,9 @@
-# cockpit-docker
+# VersaNode Cockpit Container Applications
 
-This is the [Cockpit](https://cockpit-project.org/) user interface for [docker
-containers](https://docker.io/). 
-
+This is the [Cockpit](https://cockpit-project.org/) user interface for VersaNode Application Containers
 ## Technologies
 
  - cockpit-docker communicates to docker through its [REST API](https://docs.docker.com/engine/api/v1.43/).
-
- - This project is based on [cockpit-podman](https://github.com/cockpit-project/cockpit-podman), I ported as much as I could to the docker API, but not everything maps (e.g. pods) and not everything is ported yet.
 
 # Development dependencies
 
