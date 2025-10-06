@@ -4,11 +4,11 @@
     ],
     "menu": {
         "index": {
-            "label": "Docker containers",
+            "label": "VersaNode Applications",
             "order": 50,
             "keywords": [
                 {
-                    "matches": ["docker", "container", "image"]
+                    "matches": ["application", "container", "image"]
                 }
             ]
         }
