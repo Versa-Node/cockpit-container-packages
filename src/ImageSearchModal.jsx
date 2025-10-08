@@ -35,6 +35,30 @@ const isGhcrVersaNodeTerm = (term) =>
 const isGhcpVersaNodeTerm = (term) =>
   /^ghcp\.io\/versa-node\/[^/]+/i.test(term || "");
 
+// Pretty label: show vncp-<package> for our GHCR images
+const buildShortLabel = (full) => {
+  if (!/^ghcr\.io\/versa-node\//i.test(full)) return full;
+  return `vncp-${parseGhcrRepoName(full)}`;
+};
+
+// File save name: strip registry, prefer vncp-<package>-<tag|sha256-...>
+const buildSaveName = (full, tagOrDigestIn) => {
+  const norm = (tagOrDigestIn || "latest").replace(/^@/, "");
+  const tagPart = norm.startsWith("sha256:") ? `sha256-${norm.slice(7)}` : norm;
+
+  if (/^ghcr\.io\/versa-node\//i.test(full)) {
+    const pkg = parseGhcrRepoName(full); // just the repo
+    return `vncp-${pkg}-${tagPart}`;
+  }
+
+  // Generic fallback: strip registry and org, keep repo
+  // e.g. "docker.io/library/nginx" -> "nginx"
+  const repoOnly = full.replace(/^[^/]+\/+/, "").replace(/:.+$/, ""); // drop registry and tag
+  const base = repoOnly.split("/").pop() || repoOnly; // last segment
+  return `${base}-${tagPart}`;
+};
+
+
 // turn free text into the final ghcr.io/versa-node/<name>
 const buildGhcrVersaNodeName = (txt) => {
   const t = (txt || "").trim()
@@ -51,35 +75,8 @@ const parseGhcrRepoName = (full) => {
   return noTag.replace(/^ghcr\.io\/?versa-node\/?/i, "").replace(/^\/+/, "");
 };
 
-// -------- vncp local naming --------
-// Build a local "vncp-package/<repo>:<tag>" from any selected image + tag/digest
-function buildVncpLocalRef(sourceName, tagOrDigest) {
-  // Determine repo (last path segment by default)
-  let repo = "";
-  if (/^ghcr\.io\/versa-node\//i.test(sourceName)) {
-    repo = parseGhcrRepoName(sourceName);
-  } else {
-    // fallback: last segment after '/'
-    const noTag = sourceName.split(':')[0];
-    const parts = noTag.split('/');
-    repo = parts[parts.length - 1] || noTag;
-  }
-
-  // normalize tag/digest
-  let suffix = "";
-  if (!tagOrDigest || tagOrDigest === "latest") {
-    suffix = ":latest";
-  } else if (/^@?sha256:[a-f0-9]{64}$/i.test(tagOrDigest)) {
-    // digest syntax accepted by docker: '@sha256:...'
-    suffix = tagOrDigest.startsWith('@') ? tagOrDigest : '@' + tagOrDigest;
-  } else {
-    suffix = ":" + tagOrDigest;
-  }
-
-  return `vncp-package/${repo}${suffix}`;
-}
-
 // -------------------- SIMPLE IN-MEMORY CACHES --------------------
+// (module-level -> persists across component mounts in the same session)
 const ghcrOrgCache = { list: null, at: 0 }; // {list: [{name, description}], at: ts}
 const descCache = new Map(); // key: `${name}@${tag}` -> description
 const tagsCache = new Map(); // key: repo -> [tags]
@@ -91,6 +88,7 @@ const MIN = 60 * 1000;
 const isFresh = (ts, maxAgeMs) => ts && (now() - ts) < maxAgeMs;
 
 // -------------------- ORG LIST (GitHub Packages REST) --------------------
+// If token file is missing or not permitted, return an empty list silently.
 async function fetchGhcrOrgPackagesViaSpawn({ bypassCache = false } = {}) {
   if (!bypassCache && ghcrOrgCache.list && isFresh(ghcrOrgCache.at, 10 * MIN)) {
     return ghcrOrgCache.list;
@@ -132,7 +130,7 @@ fi
     const pkgs = JSON.parse(out || "[]");
     const normalized = (pkgs || []).map(p => ({
       name: `ghcr.io/versa-node/${p.name}`,
-      description: (p.description || "").trim(),
+      description: (p.description || "").trim(),  // fallback (GitHub package description)
     }));
     ghcrOrgCache.list = normalized;
     ghcrOrgCache.at = now();
@@ -257,7 +255,7 @@ fi
   }
 }
 
-// -------------------- DESCRIPTION (SIGPIPE-safe) --------------------
+// -------------------- DESCRIPTION (SIGPIPE-safe, tempfiles, single- or multi-arch) --------------------
 async function fetchGhcrOciDescriptionViaSpawn(fullName, tagIn, { bypassCache = false } = {}) {
   const repo = parseGhcrRepoName(fullName);
   let tag = (tagIn || "latest").trim();
@@ -281,48 +279,83 @@ ACPT_MAN="Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.do
 ACPT_CFG="Accept: application/vnd.oci.image.config.v1+json, application/vnd.docker.container.image.v1+json"
 
 authcurl() {
+  # $1=url, $2=acceptHeader
   if [ -n "$TOKEN" ]; then
     curl -fsSL -H "$UA" -H "$2" -H "Docker-Distribution-API-Version: registry/2.0" -H "Authorization: Bearer $TOKEN" "$1"
-  } else {
+  else
     curl -fsSL -H "$UA" -H "$2" -H "Docker-Distribution-API-Version: registry/2.0" "$1"
-  }
+  fi
 }
 
-json_is_valid_file() { [ -s "$1" ] || return 1; python3 - "$1" >/dev/null 2>&1 <<'PY'
-import json,sys;p=sys.argv[1];json.load(open(p,'r',encoding='utf-8'))
+# -- helpers that avoid pipelines (no SIGPIPE) --
+json_is_valid_file() {
+  # $1=path
+  [ -s "$1" ] || return 1
+  python3 - "$1" >/dev/null 2>&1 <<'PY'
+import json,sys
+p=sys.argv[1]
+with open(p,'r',encoding='utf-8',errors='strict') as f:
+    json.load(f)
 PY
 }
-cfg_digest_from_manifest_file() { python3 - "$1" <<'PY'
-import json,sys;m=json.load(open(sys.argv[1]));print((m.get("config") or {}).get("digest",""))
+
+cfg_digest_from_manifest_file() {
+  python3 - "$1" <<'PY'
+import json,sys
+p=sys.argv[1]
+m=json.load(open(p,'r',encoding='utf-8'))
+print((m.get("config") or {}).get("digest",""))
 PY
 }
-select_manifest_digest_from_index_file() { python3 - "$1" <<'PY'
-import json,sys;m=json.load(open(sys.argv[1]));mans=m.get("manifests") or [];c=None
+
+select_manifest_digest_from_index_file() {
+  python3 - "$1" <<'PY'
+import json,sys
+p=sys.argv[1]
+m=json.load(open(p,'r',encoding='utf-8'))
+mans=m.get("manifests") or []
+chosen=None
 for e in mans:
     p=e.get("platform") or {}
-    if p.get("os")=="linux" and p.get("architecture")=="arm64": c=e;break
-if not c and mans: c=mans[0]
-print((c or {}).get("digest","") or "")
+    if p.get("os")=="linux" and p.get("architecture")=="arm64":
+        chosen=e; break
+if not chosen and mans:
+    chosen=mans[0]
+print((chosen or {}).get("digest","") or "")
 PY
 }
-media_type_from_file() { python3 - "$1" <<'PY'
-import json,sys;print(json.load(open(sys.argv[1])).get("mediaType",""))
+
+media_type_from_file() {
+  python3 - "$1" <<'PY'
+import json,sys
+p=sys.argv[1]
+m=json.load(open(p,'r',encoding='utf-8'))
+print(m.get("mediaType",""))
 PY
 }
-desc_from_config_file() { python3 - "$1" <<'PY'
-import json,sys;cfg=json.load(open(sys.argv[1]));labels=(cfg.get("config") or {}).get("Labels") or {}
+
+desc_from_config_file() {
+  python3 - "$1" <<'PY'
+import json,sys
+p=sys.argv[1]
+cfg=json.load(open(p,'r',encoding='utf-8'))
+labels=(cfg.get("config") or {}).get("Labels") or {}
 print((labels.get("org.opencontainers.image.description","") or "").strip())
 PY
 }
 
+# temp files
 MAN_FILE="$(mktemp)"; SUB_FILE="$(mktemp)"; CFG_FILE="$(mktemp)"
-trap 'rm -f "$MAN_FILE" "$SUB_FILE" "$CFG_FILE"' EXIT
+cleanup() { rm -f "$MAN_FILE" "$SUB_FILE" "$CFG_FILE"; }
+trap cleanup EXIT
 
+# 1) top-level manifest
 MAN_URL="https://ghcr.io/v2/versa-node/$REPO/manifests/$TAG"
 authcurl "$MAN_URL" "$ACPT_MAN" >"$MAN_FILE" || true
 json_is_valid_file "$MAN_FILE" || { echo ""; exit 0; }
 
 TYPE="$(media_type_from_file "$MAN_FILE")"
+
 CFG_DIG=""
 if echo "$TYPE" | grep -qE 'image\\.manifest|manifest\\.v2'; then
   CFG_DIG="$(cfg_digest_from_manifest_file "$MAN_FILE")"
@@ -336,11 +369,15 @@ else
 fi
 
 [ -n "$CFG_DIG" ] || { echo ""; exit 0; }
+
+# 2) fetch config blob and read label
 CFG_URL="https://ghcr.io/v2/versa-node/$REPO/blobs/$CFG_DIG"
 authcurl "$CFG_URL" "$ACPT_CFG" >"$CFG_FILE" || true
 json_is_valid_file "$CFG_FILE" || { echo ""; exit 0; }
+
 desc_from_config_file "$CFG_FILE"
 `;
+
   try {
     const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
     const desc = (out || "").trim();
@@ -348,7 +385,7 @@ desc_from_config_file "$CFG_FILE"
     console.debug("[GHCR] description (cached)", `${repo}:${tag}`, "=>", desc ? desc.substring(0, 80) + (desc.length > 80 ? "…" : "") : "<empty>");
     return desc;
   } catch (e) {
-    console.warn("[GHCR] fetchGhcrOciDescriptionViaSpawn failed:", e?.message || e, e);
+    console.warn("[GHCR] fetchGhcrOciDescriptionViaSpawn (sigpipe-safe) failed:", e?.message || e, e);
     descCache.set(cacheKey, "");
     return "";
   }
@@ -365,7 +402,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
   const [dialogErrorDetail, setDialogErrorDetail] = useState("");
   const [typingTimeout,     setTypingTimeout]     = useState(null);
   const [ghcrOrgListing,    setGhcrOrgListing]    = useState(false);
-  const [reloadNonce,       setReloadNonce]       = useState(0);
+  const [reloadNonce,       setReloadNonce]       = useState(0); // bump to force reload/bypass cache
 
   // Tag handling
   const [tagOptions,  setTagOptions]  = useState([]);
@@ -384,6 +421,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
       ? registries.search
       : fallbackRegistries;
 
+  // include ghcp.io (alias) at the front for convenience
   const mergedRegistries = Array.from(new Set(["ghcr.io", "ghcp.io", ...(baseRegistries || [])]));
 
   const closeActiveConnection = () => {
@@ -393,6 +431,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
     }
   };
 
+  // Initial org listing if GHCR/alias & empty query
   useEffect(() => {
     if ((isGhcr(selectedRegistry) || isGhcp(selectedRegistry)) && imageIdentifier.trim() === "") {
       onSearchTriggered(selectedRegistry, true, { bypassCache: false });
@@ -400,6 +439,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Switch to GHCR/alias with empty query => list org packages
   useEffect(() => {
     if ((isGhcr(selectedRegistry) || isGhcp(selectedRegistry)) && imageIdentifier.trim() === "") {
       onSearchTriggered(selectedRegistry, true, { bypassCache: false });
@@ -407,6 +447,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedRegistry]);
 
+  // Clearing query while GHCR/alias => list org packages
   useEffect(() => {
     if ((isGhcr(selectedRegistry) || isGhcp(selectedRegistry)) && imageIdentifier.trim() === "") {
       onSearchTriggered(selectedRegistry, true, { bypassCache: false });
@@ -414,6 +455,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [imageIdentifier]);
 
+  // On selection change, fetch tags and description
   useEffect(() => {
     const idx = (selected || "") === "" ? -1 : parseInt(selected, 10);
     if (Number.isNaN(idx) || idx < 0 || idx >= imageList.length) return;
@@ -422,6 +464,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
 
     const isVersaNodeGhcr = /^ghcr\.io\/versa-node\//i.test(img.name);
 
+    // Reset tag UI
     setTagOptions([]);
     setSelectedTag("latest");
     setCustomTag("");
@@ -430,6 +473,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
     console.debug("[UI] Selected index:", idx, "image:", img.name);
 
     if (isVersaNodeGhcr) {
+      // Tags (use cache)
       (async () => {
         setTagLoading(true);
         try {
@@ -446,6 +490,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
         }
       })();
 
+      // Description for currently selected (respect tag)
       (async () => {
         const tag = selectedTag || "latest";
         const desc = await fetchGhcrOciDescriptionViaSpawn(img.name, tag, { bypassCache: false });
@@ -463,6 +508,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected, reloadNonce]);
 
+  // If tag changes, refresh description for selected item
   useEffect(() => {
     const idx = (selected || "") === "" ? -1 : parseInt(selected, 10);
     if (Number.isNaN(idx) || idx < 0 || idx >= imageList.length) return;
@@ -488,6 +534,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedTag]);
 
+  // Enrich GHCR org list items with descriptions (batch + cache)
   async function enrichListWithDescriptions(list, { bypassCache = false } = {}) {
     const out = [...list];
     const idxs = out
@@ -496,6 +543,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
 
     if (idxs.length === 0) return out;
 
+    // fetch all descriptions in parallel (prefer 'latest')
     const promises = idxs.map(i => {
       const n = out[i].name;
       return fetchGhcrOciDescriptionViaSpawn(n, "latest", { bypassCache })
@@ -521,6 +569,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
       || isGhcrVersaNodeTerm(imageIdentifier)
       || isGhcpVersaNodeTerm(imageIdentifier);
 
+    // Repo term derived from input; strip both ghcp.io and ghcr.io prefixes
     const typedRepo = imageIdentifier
       .replace(/^ghcp\.io\/?versa-node\/?/i, "")
       .replace(/^ghcr\.io\/?versa-node\/?/i, "")
@@ -529,6 +578,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
 
     console.debug("[UI] Search triggered:", { searchRegistry, ghLikeRegistry, targetGhLike, typedRepo, forceSearch, imageIdentifier, bypassCache });
 
+    // GH-like (ghcr.io or ghcp.io alias) behavior
     if (targetGhLike) {
       setDialogError(""); setDialogErrorDetail("");
       setSearchInProgress(true);
@@ -537,6 +587,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
         const pkgs = await fetchGhcrOrgPackagesViaSpawn({ bypassCache });
         let working = pkgs;
 
+        // If using ghcp.io OR user typed a repo under ghcp/ghcr, filter locally
         if (isGhcp(searchRegistry) || /^ghcp\.io\//i.test(imageIdentifier) || (typedRepo && isGhcp(selectedRegistry))) {
           const q = typedRepo.toLowerCase();
           working = pkgs.filter(p => {
@@ -544,6 +595,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
             return repo.toLowerCase().includes(q) || (p.description || "").toLowerCase().includes(q);
           });
         } else if (typedRepo.length && isGhcr(searchRegistry)) {
+          // For explicit ghcr.io selection with a repo text, show that single target
           const fullName = buildGhcrVersaNodeName(imageIdentifier);
           working = [{ name: fullName, description: "" }];
         }
@@ -559,6 +611,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
       return;
     }
 
+    // Docker Hub (or registries that support /images/search)
     if (imageIdentifier.length < 2 && !forceSearch) {
       setGhcrOrgListing(false);
       return;
@@ -631,33 +684,17 @@ export const ImageSearchModal = ({ downloadImage }) => {
     const selectedImageName = imageList[selected].name;
     closeActiveConnection();
     Dialogs.close();
-
-    // pick tag/digest
     const raw = tagOptions.length > 0
       ? (selectedTag || "latest")
       : ((customTag || "").trim() || "latest");
 
-    // pass digest as-is
+    // pass through digest syntax (@sha256:...)
     const isDigest = /^@?sha256:[a-f0-9]{64}$/i.test(raw);
     const tagOrDigest = isDigest ? (raw.startsWith('@') ? raw : '@' + raw) : raw;
 
-    // build the local vncp alias/tag
-    const localRef = buildVncpLocalRef(selectedImageName, tagOrDigest);
-    console.debug("[UI] Download clicked:", { pull: selectedImageName, tagOrDigest, saveAs: localRef });
-
-    // Call pattern 1: (src, tagOrDigest, saveAs)
-    // If your implementation expects an options object, we fall back to pattern 2.
-    try {
-      if (downloadImage.length >= 3) {
-        downloadImage(selectedImageName, tagOrDigest, localRef);
-      } else {
-        // pattern 2: (src, tagOrDigest, { saveAs })
-        downloadImage(selectedImageName, tagOrDigest, { saveAs: localRef });
-      }
-    } catch (e) {
-      // last resort: keep old behavior
-      downloadImage(selectedImageName, tagOrDigest);
-    }
+    console.debug("[UI] Download clicked:", { image: selectedImageName, tagOrDigest });
+    const suggestedName = buildSaveName(selectedImageName, tagOrDigest);
+    downloadImage(selectedImageName, tagOrDigest, { saveAs: suggestedName });
   };
 
   const handleClose = () => {
@@ -666,6 +703,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
   };
 
   const onReload = async () => {
+    // bypass cache: clear token/tags/desc for items we have and refresh
     const names = imageList.map(x => x?.name).filter(Boolean);
     names.forEach(n => {
       const repo = parseGhcrRepoName(n);
@@ -674,6 +712,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
         tagsCache.delete(repo);
       }
     });
+    // clear desc cache for displayed names (any tag)
     Array.from(descCache.keys()).forEach(k => {
       if (names.some(n => k.startsWith(n + "@"))) descCache.delete(k);
     });
@@ -682,11 +721,18 @@ export const ImageSearchModal = ({ downloadImage }) => {
     await onSearchTriggered(selectedRegistry, true, { bypassCache: true });
   };
 
+  // Tag picker UI
   const TagPicker = () => {
     if (tagLoading) {
       return (
         <FormGroup fieldId="image-search-tag" label={_("Tag")}>
-          <TextInput id="image-search-tag" type="text" isDisabled value={_("Loading…")} aria-label="loading tags" />
+          <TextInput
+            id="image-search-tag"
+            type="text"
+            isDisabled
+            value={_("Loading…")}
+            aria-label="loading tags"
+          />
         </FormGroup>
       );
     }
@@ -822,7 +868,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
                     <DataListItemCells
                       dataListCells={[
                         <DataListCell key="primary content">
-                          <span className="image-name">{image.name}</span>
+                          <span className="image-name">{buildShortLabel(image.name)}</span>
                         </DataListCell>,
                         <DataListCell key="secondary content" wrapModifier="truncate">
                           <span className="image-description">
