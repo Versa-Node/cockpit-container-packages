@@ -1,3 +1,4 @@
+// cockpit-components-dynamic-list.jsx
 import React from 'react';
 import PropTypes from 'prop-types';
 import { Button } from "@patternfly/react-core/dist/esm/components/Button";
@@ -19,26 +20,32 @@ function summarize(list, max = 5) {
   return out;
 }
 
-// Normalize itemcomponent so we always have a valid “type” for React.createElement
+// Normalize an array of rows for comparison: drop `key`, keep holes
+function normalizeForCompare(value) {
+  if (!Array.isArray(value)) return '[]';
+  const norm = value.map(v => {
+    if (v === undefined) return '__hole__';
+    const { key, ...rest } = (v || {});
+    return rest;
+  });
+  try { return JSON.stringify(norm); } catch { return String(norm); }
+}
+
+// Normalize itemcomponent to a valid type for React.createElement
 function resolveItemType(ic) {
-  // Already a valid React element? unwrap to its component type
-  if (React.isValidElement(ic)) {
-    return ic.type;
-  }
-  // A function/class component or a special React type (memo/forwardRef objects) is fine
-  if (typeof ic === 'function' || (ic && typeof ic === 'object' && ic.$$typeof)) {
-    return ic;
-  }
+  if (React.isValidElement(ic)) return ic.type;
+  if (typeof ic === 'function' || (ic && typeof ic === 'object' && ic.$$typeof)) return ic;
   return null;
 }
 
-/* Dynamic list with a variable number of rows. */
 export class DynamicListForm extends React.Component {
   constructor(props) {
     super(props);
 
     const { list, nextKey } = this._hydrateFromValue(props.value, 0, props.id);
     this.state = { list, keyCounter: nextKey };
+
+    this._lastNormValue = normalizeForCompare(props.value);
 
     this.removeItem = this.removeItem.bind(this);
     this.addItem = this.addItem.bind(this);
@@ -68,31 +75,30 @@ export class DynamicListForm extends React.Component {
 
   componentDidMount() {
     console.log(`${dbg(this.props.id)} mounted list len:`, this.state.list.filter(Boolean).length);
-    if (Array.isArray(this.props.value) && this.props.value.length > 0 && this.state.list.filter(Boolean).length === 0) {
+    // No onChange here — parent is the source of truth for `value`
+  }
+
+  componentDidUpdate(prevProps) {
+    // Only sync when the *normalized* content of value actually changes
+    const nextNorm = normalizeForCompare(this.props.value);
+    if (nextNorm !== this._lastNormValue) {
+      console.groupCollapsed(`${dbg(this.props.id)} props.value changed`);
+      console.log('prev norm:', this._lastNormValue);
+      console.log('next norm:', nextNorm);
       const { list, nextKey } = this._hydrateFromValue(this.props.value, this.state.keyCounter, this.props.id);
+      this._lastNormValue = nextNorm; // update snapshot BEFORE setState callback to avoid loops
       this.setState({ list, keyCounter: nextKey }, () => {
-        console.log(`${dbg(this.props.id)} didMount sync -> list len:`, this.state.list.filter(Boolean).length);
-        this.props.onChange?.(this.state.list);
+        console.log('synced state.list len:', this.state.list.filter(Boolean).length, summarize(this.state.list));
+        console.groupEnd();
+        // IMPORTANT: Do NOT call this.props.onChange() here — avoids parent <-> child ping-pong loops
       });
     }
   }
 
-  componentDidUpdate(prevProps) {
-    const valueChanged =
-      this.props.value !== prevProps.value ||
-      (Array.isArray(this.props.value) && Array.isArray(prevProps.value) &&
-        this.props.value.length !== prevProps.value.length);
-
-    if (valueChanged) {
-      console.groupCollapsed(`${dbg(this.props.id)} props.value changed`);
-      console.log('prev len:', Array.isArray(prevProps.value) ? prevProps.value.length : '(na)', 'next len:', Array.isArray(this.props.value) ? this.props.value.length : '(na)');
-      const { list, nextKey } = this._hydrateFromValue(this.props.value, this.state.keyCounter, this.props.id);
-      this.setState({ list, keyCounter: nextKey }, () => {
-        console.log('synced state.list len:', this.state.list.filter(Boolean).length, summarize(this.state.list));
-        console.groupEnd();
-        this.props.onChange?.(this.state.list);
-      });
-    }
+  // Centralized emitter for user-driven changes (add/remove/edit)
+  _emitChange(nextList) {
+    this._lastNormValue = normalizeForCompare(nextList); // anticipate parent echo
+    this.props.onChange?.(nextList);
   }
 
   removeItem(idx) {
@@ -102,11 +108,11 @@ export class DynamicListForm extends React.Component {
 
     this.setState(state => {
       const items = [...state.list];
-      delete items[idx];
+      delete items[idx]; // keep holes
       return { list: items };
     }, () => {
       console.log(`${dbg(this.props.id)} removeItem(${idx}) -> non-empty len:`, this.state.list.filter(Boolean).length);
-      this.props.onChange?.(this.state.list);
+      this._emitChange(this.state.list);
     });
   }
 
@@ -116,7 +122,7 @@ export class DynamicListForm extends React.Component {
       return { list: [...state.list, next], keyCounter: state.keyCounter + 1 };
     }, () => {
       console.log(`${dbg(this.props.id)} addItem -> len:`, this.state.list.filter(Boolean).length);
-      this.props.onChange?.(this.state.list);
+      this._emitChange(this.state.list);
     });
   }
 
@@ -130,7 +136,7 @@ export class DynamicListForm extends React.Component {
       return { list: items, keyCounter: nextKey };
     }, () => {
       console.log(`${dbg(this.props.id)} onItemChange idx=${idx}, field=${field} ->`, this.state.list[idx]);
-      this.props.onChange?.(this.state.list);
+      this._emitChange(this.state.list);
     });
   }
 
