@@ -12,7 +12,7 @@ import { NumberInput } from "@patternfly/react-core/dist/esm/components/NumberIn
 import { InputGroup, InputGroupText } from "@patternfly/react-core/dist/esm/components/InputGroup";
 import { TextInput } from "@patternfly/react-core/dist/esm/components/TextInput";
 import { Tab, TabTitleText, Tabs } from "@patternfly/react-core/dist/esm/components/Tabs";
-import { Text, TextContent, TextList, TextListItem, TextVariants } from "@patternfly/react-core/dist/esm/components/Text";
+import { Text } from "@patternfly/react-core/dist/esm/components/Text";
 import { ToggleGroup, ToggleGroupItem } from "@patternfly/react-core/dist/esm/components/ToggleGroup";
 import { Flex, FlexItem } from "@patternfly/react-core/dist/esm/layouts/Flex";
 import { Popover } from "@patternfly/react-core/dist/esm/components/Popover";
@@ -61,6 +61,46 @@ const buildGhcrVersaNodeName = (txt) => {
   return (GHCR_NAMESPACE + t).replace(/\/+$/, "");
 };
 
+/* ------------------------ helpers for prefill ------------------------ */
+
+// env: ["KEY=VAL", "FOO=BAR"] -> [{ envKey, envValue }]
+function parseEnvVars(arr = []) {
+    return arr.map(line => {
+        const idx = line.indexOf("=");
+        if (idx === -1) return { envKey: line, envValue: "" };
+        return { envKey: line.slice(0, idx), envValue: line.slice(idx + 1) };
+    });
+}
+
+// volumes: { "/path/in/container": {} } -> [{ containerPath, hostPath:null, readOnly:false }]
+function parseVolumes(volObj = {}) {
+    return Object.keys(volObj).map(containerPath => ({
+        containerPath,
+        hostPath: null,
+        readOnly: false,
+    }));
+}
+
+// exposed ports: { "8080/tcp": {}, "9000/udp": {} } -> [{ IP:null, containerPort:"8080", hostPort:null, protocol:"tcp" }, ...]
+function parseExposedPorts(exposed = {}) {
+    return Object.keys(exposed).map(k => {
+        const [port, proto] = k.split("/");
+        return { IP: null, containerPort: port, hostPort: null, protocol: (proto || "tcp").toLowerCase() };
+    });
+}
+
+// local image detection (by Id or RepoTags)
+function isLocalImageRef(imageObjOrName, localImages = []) {
+    if (!imageObjOrName) return false;
+    if (typeof imageObjOrName === "object" && imageObjOrName.Id) {
+        return !!localImages.find(li => li.Id === imageObjOrName.Id);
+    }
+    if (typeof imageObjOrName === "string") {
+        return !!localImages.find(li => (li.RepoTags || []).includes(imageObjOrName));
+    }
+    return false;
+}
+
 export class ImageRunModal extends React.Component {
     constructor(props) {
         super(props);
@@ -103,7 +143,7 @@ export class ImageRunModal extends React.Component {
             searchText: "",
             imageResults: {},
             isImageSelectOpen: false,
-            searchByRegistry: 'all', // 'all' | 'local' | 'docker.io' | 'ghcr.io'
+            searchByRegistry: 'all',
             /* health check */
             healthcheck_command: "",
             healthcheck_shell: false,
@@ -112,6 +152,9 @@ export class ImageRunModal extends React.Component {
             healthcheck_start_period: 0,
             healthcheck_retries: 3,
             healthcheck_action: 0,
+            /* prefill */
+            prefillLoading: false,
+            prefillNonce: 0, // bump to force DynamicListForm remount
         };
         this.getCreateConfig = this.getCreateConfig.bind(this);
         this.onValueChanged = this.onValueChanged.bind(this);
@@ -120,14 +163,72 @@ export class ImageRunModal extends React.Component {
     componentDidMount() {
         this._isMounted = true;
         this.onSearchTriggered(this.state.searchText);
+        // Prefill from local image (if dialog opened from an image row)
+        if (this.props.image) {
+            this.loadImageDefaults(this.props.image);
+        }
     }
 
     componentWillUnmount() {
         this._isMounted = false;
-
         if (this.activeConnection)
             this.activeConnection.close();
     }
+
+    /* ---------------------- inspect + prefill from image ---------------------- */
+    loadImageDefaults = async (imageRef) => {
+        try {
+            if (!imageRef) return;
+
+            // resolve inspect ref
+            let ref = imageRef;
+            if (typeof imageRef === "object") {
+                ref = imageRef.Id || imageRef.RepoTags?.[0] || imageRef.Name || "";
+            }
+            if (!ref) return;
+
+            this.setState({ prefillLoading: true });
+
+            const conn = rest.connect(client.getAddress());
+            const resp = await conn.call({
+                method: "GET",
+                path: client.VERSION + "/images/" + encodeURIComponent(ref) + "/json",
+                body: "",
+            });
+            const inspected = JSON.parse(resp);
+            const cfg = inspected?.Config || {};
+            const envArr = cfg.Env || [];
+            const volObj = cfg.Volumes || {};
+            const exposed = inspected?.Config?.ExposedPorts || inspected?.ContainerConfig?.ExposedPorts || {};
+
+            const nextState = {};
+            const hasUserEnv = (this.state.env || []).some(x => x !== undefined);
+            const hasUserVol = (this.state.volumes || []).some(x => x !== undefined);
+            const hasUserPorts = (this.state.publish || []).some(x => x !== undefined);
+
+            if (!hasUserEnv && envArr.length) {
+                nextState.env = parseEnvVars(envArr);
+            }
+            if (!hasUserVol && volObj && Object.keys(volObj).length) {
+                nextState.volumes = parseVolumes(volObj);
+            }
+            if (!hasUserPorts && exposed && Object.keys(exposed).length) {
+                nextState.publish = parseExposedPorts(exposed);
+            }
+
+            if (Object.keys(nextState).length) {
+                // bump nonce to force DynamicListForm remount with new controlled value
+                nextState.prefillNonce = (this.state.prefillNonce || 0) + 1;
+            }
+
+            if (this._isMounted) {
+                this.setState({ ...nextState, prefillLoading: false });
+            }
+        } catch (e) {
+            console.warn("[ImageRunModal] loadImageDefaults failed:", e);
+            if (this._isMounted) this.setState({ prefillLoading: false });
+        }
+    };
 
     getCreateConfig() {
         const createConfig = {};
@@ -137,10 +238,7 @@ export class ImageRunModal extends React.Component {
             createConfig.image = this.state.image.RepoTags.length > 0 ? this.state.image.RepoTags[0] : "";
         } else {
             let img = this.state.selectedImage.Name;
-            // Make implicit :latest
-            if (!img.includes(":")) {
-                img += ":latest";
-            }
+            if (!img.includes(":")) img += ":latest";
             createConfig.image = img;
         }
 
@@ -167,14 +265,19 @@ export class ImageRunModal extends React.Component {
                 .filter(port => port?.containerPort)
                 .forEach(item => {
                     ExposedPorts[item.containerPort + "/" + item.protocol] = {};
-                    const mapping = { HostPort: item.hostPort };
-                    if (item.IP)
-                        mapping.HostIp = item.IP;
-                    PortBindings[item.containerPort + "/" + item.protocol] = [mapping];
+                    const mapping = {};
+                    if (item.hostPort) mapping.HostPort = item.hostPort;
+                    if (item.IP) mapping.HostIp = item.IP;
+                    // Only set binding if hostPort or IP provided; otherwise only ExposedPorts
+                    if (Object.keys(mapping).length > 0) {
+                        PortBindings[item.containerPort + "/" + item.protocol] = [mapping];
+                    }
                 });
 
-            createConfig.HostConfig.PortBindings = PortBindings;
-            createConfig.ExposedPorts = ExposedPorts;
+            if (Object.keys(PortBindings).length > 0)
+                createConfig.HostConfig.PortBindings = PortBindings;
+            if (Object.keys(ExposedPorts).length > 0)
+                createConfig.ExposedPorts = ExposedPorts;
         }
 
         if (this.state.env.some(item => item !== undefined)) {
@@ -227,7 +330,6 @@ export class ImageRunModal extends React.Component {
         }
 
         console.log("createConfig", createConfig);
-
         return createConfig;
     }
 
@@ -348,8 +450,7 @@ export class ImageRunModal extends React.Component {
             return;
         }
 
-        // GHCR (versa-node) synthetic result if footer toggled to ghcr.io or user typed versa-node/...
-        const selectedIndex = this.state.searchByRegistry; // 'all' | 'local' | 'docker.io' | 'ghcr.io'
+        const selectedIndex = this.state.searchByRegistry;
         const targetGhcr = selectedIndex === 'ghcr.io' || isGhcrVersaNodeTerm(value);
         if (targetGhcr) {
             const name = buildGhcrVersaNodeName(value);
@@ -456,7 +557,7 @@ export class ImageRunModal extends React.Component {
         this.setState({ isImageSelectOpen: isOpen });
     };
 
-    onImageSelect = (event, value, placeholder) => {
+    onImageSelect = (event, value) => {
         if (event === undefined) return;
 
         let command = this.state.command;
@@ -470,6 +571,11 @@ export class ImageRunModal extends React.Component {
             isImageSelectOpen: false,
             command,
             entrypoint,
+        }, () => {
+            // Prefill if the selected is a local image
+            if (isLocalImageRef(value, this.props.localImages || [])) {
+                this.loadImageDefaults(value);
+            }
         });
     };
 
@@ -648,7 +754,7 @@ export class ImageRunModal extends React.Component {
             imageListOptions = this.filterImages();
         }
 
-        const localImage = this.state.image || (selectedImage && this.props.localImages.some(img => img.Id === selectedImage.Id));
+        const localImage = this.state.image || (selectedImage && this.props.localImages?.some(img => img.Id === selectedImage.Id));
         const dockerRegistries = registries && registries.search ? registries.search : utils.fallbackRegistries;
 
         const footer = (
@@ -785,131 +891,18 @@ export class ImageRunModal extends React.Component {
                                 onChange={(_event, checked) => this.onValueChanged('hasTTY', checked)}
                             />
                         </FormGroup>
-
-                        <FormGroup fieldId='run-image-dialog-memory' label={_("Memory limit")}>
-                            <Flex alignItems={{ default: 'alignItemsCenter' }} className="ct-input-group-spacer-sm modal-run-limiter" id="run-image-dialog-memory-limit">
-                                <Checkbox
-                                    id="run-image-dialog-memory-limit-checkbox"
-                                    isChecked={this.state.memoryConfigure}
-                                    onChange={(_event, checked) => this.onValueChanged('memoryConfigure', checked)}
-                                />
-                                <NumberInput
-                                    value={dialogValues.memory}
-                                    id="run-image-dialog-memory"
-                                    min={0}
-                                    isDisabled={!this.state.memoryConfigure}
-                                    onClick={() => !this.state.memoryConfigure && this.onValueChanged('memoryConfigure', true)}
-                                    onPlus={() => this.onPlusOne('memory')}
-                                    onMinus={() => this.onMinusOne('memory')}
-                                    minusBtnAriaLabel={_("Decrease memory")}
-                                    plusBtnAriaLabel={_("Increase memory")}
-                                    onChange={ev => this.onValueChanged('memory', parseInt(ev.target.value) < 0 ? 0 : ev.target.value)}
-                                />
-                                <FormSelect
-                                    id='memory-unit-select'
-                                    aria-label={_("Memory unit")}
-                                    value={this.state.memoryUnit}
-                                    isDisabled={!this.state.memoryConfigure}
-                                    className="dialog-run-form-select"
-                                    onChange={(_event, value) => this.onValueChanged('memoryUnit', value)}
-                                >
-                                    <FormSelectOption value={units.KB.name} key={units.KB.name} label={_("KB")} />
-                                    <FormSelectOption value={units.MB.name} key={units.MB.name} label={_("MB")} />
-                                    <FormSelectOption value={units.GB.name} key={units.GB.name} label={_("GB")} />
-                                </FormSelect>
-                            </Flex>
-                        </FormGroup>
-
-                        <FormGroup
-                            fieldId='run-image-cpu-priority'
-                            label={_("CPU shares")}
-                            labelIcon={
-                                <Popover
-                                    aria-label={_("CPU Shares help")}
-                                    enableFlip
-                                    bodyContent={_("CPU shares determine the priority of running containers. Default priority is 1024. A higher number prioritizes this container. A lower number decreases priority.")}
-                                >
-                                    <button onClick={e => e.preventDefault()} className="pf-v5-c-form__group-label-help">
-                                        <OutlinedQuestionCircleIcon />
-                                    </button>
-                                </Popover>
-                            }
-                        >
-                            <Flex alignItems={{ default: 'alignItemsCenter' }} className="ct-input-group-spacer-sm modal-run-limiter" id="run-image-dialog-cpu-priority">
-                                <Checkbox
-                                    id="run-image-dialog-cpu-priority-checkbox"
-                                    isChecked={this.state.cpuSharesConfigure}
-                                    onChange={(_event, checked) => this.onValueChanged('cpuSharesConfigure', checked)}
-                                />
-                                <NumberInput
-                                    id="run-image-cpu-priority"
-                                    value={dialogValues.cpuShares}
-                                    onClick={() => !this.state.cpuSharesConfigure && this.onValueChanged('cpuSharesConfigure', true)}
-                                    min={2}
-                                    max={262144}
-                                    isDisabled={!this.state.cpuSharesConfigure}
-                                    onPlus={() => this.onPlusOne('cpuShares')}
-                                    onMinus={() => this.onMinusOne('cpuShares')}
-                                    minusBtnAriaLabel={_("Decrease CPU shares")}
-                                    plusBtnAriaLabel={_("Increase CPU shares")}
-                                    onChange={ev => this.onValueChanged('cpuShares', parseInt(ev.target.value) < 2 ? 2 : ev.target.value)}
-                                />
-                            </Flex>
-                        </FormGroup>
-
-                        {dockerRestartAvailable &&
-                            <Grid hasGutter md={6} sm={3}>
-                                <GridItem>
-                                    <FormGroup
-                                        fieldId='run-image-dialog-restart-policy'
-                                        label={_("Restart policy")}
-                                        labelIcon={
-                                            <Popover
-                                                aria-label={_("Restart policy help")}
-                                                enableFlip
-                                                bodyContent={_("Restart policy to follow when containers exit.")}
-                                            >
-                                                <button onClick={e => e.preventDefault()} className="pf-v5-c-form__group-label-help">
-                                                    <OutlinedQuestionCircleIcon />
-                                                </button>
-                                            </Popover>
-                                        }
-                                    >
-                                        <FormSelect
-                                            id="run-image-dialog-restart-policy"
-                                            aria-label={_("Restart policy help")}
-                                            value={dialogValues.restartPolicy}
-                                            onChange={(_event, value) => this.onValueChanged('restartPolicy', value)}
-                                        >
-                                            <FormSelectOption value='no' key='no' label={_("No")} />
-                                            <FormSelectOption value='on-failure' key='on-failure' label={_("On failure")} />
-                                            <FormSelectOption value='always' key='always' label={_("Always")} />
-                                        </FormSelect>
-                                    </FormGroup>
-                                </GridItem>
-
-                                {dialogValues.restartPolicy === "on-failure" &&
-                                    <FormGroup fieldId='run-image-dialog-restart-retries' label={_("Maximum retries")}>
-                                        <NumberInput
-                                            id="run-image-dialog-restart-retries"
-                                            value={dialogValues.restartTries}
-                                            min={1}
-                                            max={65535}
-                                            widthChars={5}
-                                            minusBtnAriaLabel={_("Decrease maximum retries")}
-                                            plusBtnAriaLabel={_("Increase maximum retries")}
-                                            onMinus={() => this.onMinusOne('restartTries')}
-                                            onPlus={() => this.onPlusOne('restartTries')}
-                                            onChange={ev => this.onValueChanged('restartTries', parseInt(ev.target.value) < 1 ? 1 : ev.target.value)}
-                                        />
-                                    </FormGroup>
-                                }
-                            </Grid>
-                        }
                     </Tab>
 
                     <Tab eventKey={1} title={<TabTitleText>{_("Integration")}</TabTitleText>} id="create-image-dialog-tab-integration" className="pf-v5-c-form">
+                        {/* optional tiny hint while defaults are loading */}
+                        {this.state.prefillLoading && (
+                            <div className="pf-v5-c-helper-text pf-m-inline">
+                                {_("Loading defaults from image…")}
+                            </div>
+                        )}
+
                         <DynamicListForm
+                            key={`publish-${this.state.prefillNonce}`}
                             id='run-image-dialog-publish'
                             emptyStateString={_("No ports exposed")}
                             formclass='publish-port-form'
@@ -918,11 +911,13 @@ export class ImageRunModal extends React.Component {
                             validationFailed={dialogValues.validationFailed.publish}
                             onValidationChange={value => this.dynamicListOnValidationChange('publish', value)}
                             onChange={value => this.onValueChanged('publish', value)}
+                            value={dialogValues.publish}      
                             default={{ IP: null, containerPort: null, hostPort: null, protocol: 'tcp' }}
                             itemcomponent={<PublishPort />}
                         />
 
                         <DynamicListForm
+                            key={`volumes-${this.state.prefillNonce}`}
                             id='run-image-dialog-volume'
                             emptyStateString={_("No volumes specified")}
                             formclass='volume-form'
@@ -931,12 +926,14 @@ export class ImageRunModal extends React.Component {
                             validationFailed={dialogValues.validationFailed.volumes}
                             onValidationChange={value => this.dynamicListOnValidationChange('volumes', value)}
                             onChange={value => this.onValueChanged('volumes', value)}
+                            value={dialogValues.volumes}     
                             default={{ containerPath: null, hostPath: null, readOnly: false }}
                             options={{ selinuxAvailable }}
                             itemcomponent={<Volume />}
                         />
 
                         <DynamicListForm
+                            key={`env-${this.state.prefillNonce}`}
                             id='run-image-dialog-env'
                             emptyStateString={_("No environment variables specified")}
                             formclass='env-form'
@@ -945,6 +942,7 @@ export class ImageRunModal extends React.Component {
                             validationFailed={dialogValues.validationFailed.env}
                             onValidationChange={value => this.dynamicListOnValidationChange('env', value)}
                             onChange={value => this.onValueChanged('env', value)}
+                            value={dialogValues.env}             
                             default={{ envKey: null, envValue: null }}
                             helperText={_("Paste one or more lines of key=value pairs into any field for bulk import")}
                             itemcomponent={<EnvVar />}

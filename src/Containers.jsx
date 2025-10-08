@@ -511,7 +511,7 @@ class Containers extends React.Component {
                             <FormSelectOption value='running' label={_("Only running")} />
                         </FormSelect>
                     </ToolbarItem>
-                    <Divider orientation={{ default: "vertical" }} />
+                    {/* <Divider orientation={{ default: "vertical" }} />
                     <ToolbarItem>
                         <Button variant="primary" key="get-new-image-action"
                                 id="containers-containers-create-container-btn"
@@ -519,7 +519,7 @@ class Containers extends React.Component {
                                 onClick={() => createContainer(null)}>
                             {_("Create container")}
                         </Button>
-                    </ToolbarItem>
+                    </ToolbarItem> */}
                     <ToolbarItem>
                         <ContainerOverActions unusedContainers={unusedContainers} handlePruneUnusedContainers={this.onOpenPruneUnusedContainersDialog} />
                     </ToolbarItem>
