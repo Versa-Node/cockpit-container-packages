@@ -25,44 +25,46 @@ const GH_ORG = "versa-node";             // org is case-insensitive in API paths
 const GHCR_NAMESPACE = "ghcr.io/versa-node/";
 
 const isGhcr = (reg) => (reg || "").trim().toLowerCase() === "ghcr.io";
-const isGhcp = (reg) => (reg || "").trim().toLowerCase() === "ghcp.io"; // alias
 
 // user typed a GHCR versa-node reference? (either fully-qualified or org-prefixed)
 const isGhcrVersaNodeTerm = (term) =>
   /^ghcr\.io\/versa-node\/[^/]+/i.test(term || "") || /^versa-node\/[^/]+/i.test(term || "");
 
-// user typed a GHCP (alias) versa-node reference?
-const isGhcpVersaNodeTerm = (term) =>
-  /^ghcp\.io\/versa-node\/[^/]+/i.test(term || "");
+// Strip registry/org + tag/digest from any image ref
+const stripToRepo = (ref) => {
+  if (!ref) return "";
+  // remove digest
+  let s = ref.replace(/@sha256:[a-f0-9]{64}$/i, "");
+  // split off tag
+  s = s.split(":")[0];
+  // remove leading registry/org prefixes we use
+  s = s.replace(/^ghcr\.io\//i, "")
+       .replace(/^docker\.io\//i, "")
+       .replace(/^versa-node\//i, "")
+       .replace(/^library\//i, "");
+  // keep only the last path segment as the repo name
+  const last = s.split("/").pop() || s;
+  return last;
+};
 
-// Pretty label: show vncp-<package> for our GHCR images
+// Pretty label: always show "vncp-<repo>"
 const buildShortLabel = (full) => {
-  if (!/^ghcr\.io\/versa-node\//i.test(full)) return full;
-  return `vncp-${parseGhcrRepoName(full)}`;
+  const repo = stripToRepo(full);
+  return repo.startsWith("vncp-") ? repo : `vncp-${repo}`;
 };
 
 // File save name: strip registry, prefer vncp-<package>-<tag|sha256-...>
 const buildSaveName = (full, tagOrDigestIn) => {
+  const repo = stripToRepo(full);
+  const base = repo.startsWith("vncp-") ? repo : `vncp-${repo}`;
   const norm = (tagOrDigestIn || "latest").replace(/^@/, "");
   const tagPart = norm.startsWith("sha256:") ? `sha256-${norm.slice(7)}` : norm;
-
-  if (/^ghcr\.io\/versa-node\//i.test(full)) {
-    const pkg = parseGhcrRepoName(full); // just the repo
-    return `vncp-${pkg}-${tagPart}`;
-  }
-
-  // Generic fallback: strip registry and org, keep repo
-  // e.g. "docker.io/library/nginx" -> "nginx"
-  const repoOnly = full.replace(/^[^/]+\/+/, "").replace(/:.+$/, ""); // drop registry and tag
-  const base = repoOnly.split("/").pop() || repoOnly; // last segment
   return `${base}-${tagPart}`;
 };
-
 
 // turn free text into the final ghcr.io/versa-node/<name>
 const buildGhcrVersaNodeName = (txt) => {
   const t = (txt || "").trim()
-    .replace(/^ghcp\.io\/?/i, "")  // alias support
     .replace(/^ghcr\.io\/?/i, "")
     .replace(/^versa-node\/?/i, "");
   return (GHCR_NAMESPACE + t).replace(/\/+$/, "");
@@ -282,9 +284,9 @@ authcurl() {
   # $1=url, $2=acceptHeader
   if [ -n "$TOKEN" ]; then
     curl -fsSL -H "$UA" -H "$2" -H "Docker-Distribution-API-Version: registry/2.0" -H "Authorization: Bearer $TOKEN" "$1"
-  else
+  } else {
     curl -fsSL -H "$UA" -H "$2" -H "Docker-Distribution-API-Version: registry/2.0" "$1"
-  fi
+  }
 }
 
 # -- helpers that avoid pipelines (no SIGPIPE) --
@@ -421,8 +423,8 @@ export const ImageSearchModal = ({ downloadImage }) => {
       ? registries.search
       : fallbackRegistries;
 
-  // include ghcp.io (alias) at the front for convenience
-  const mergedRegistries = Array.from(new Set(["ghcr.io", "ghcp.io", ...(baseRegistries || [])]));
+  // only ghcr.io + configured registries
+  const mergedRegistries = Array.from(new Set(["ghcr.io", ...(baseRegistries || [])]));
 
   const closeActiveConnection = () => {
     if (activeConnectionRef.current) {
@@ -431,25 +433,25 @@ export const ImageSearchModal = ({ downloadImage }) => {
     }
   };
 
-  // Initial org listing if GHCR/alias & empty query
+  // Initial org listing if GHCR & empty query
   useEffect(() => {
-    if ((isGhcr(selectedRegistry) || isGhcp(selectedRegistry)) && imageIdentifier.trim() === "") {
+    if (isGhcr(selectedRegistry) && imageIdentifier.trim() === "") {
       onSearchTriggered(selectedRegistry, true, { bypassCache: false });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Switch to GHCR/alias with empty query => list org packages
+  // Switch to GHCR with empty query => list org packages
   useEffect(() => {
-    if ((isGhcr(selectedRegistry) || isGhcp(selectedRegistry)) && imageIdentifier.trim() === "") {
+    if (isGhcr(selectedRegistry) && imageIdentifier.trim() === "") {
       onSearchTriggered(selectedRegistry, true, { bypassCache: false });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedRegistry]);
 
-  // Clearing query while GHCR/alias => list org packages
+  // Clearing query while GHCR => list org packages
   useEffect(() => {
-    if ((isGhcr(selectedRegistry) || isGhcp(selectedRegistry)) && imageIdentifier.trim() === "") {
+    if (isGhcr(selectedRegistry) && imageIdentifier.trim() === "") {
       onSearchTriggered(selectedRegistry, true, { bypassCache: false });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -564,21 +566,18 @@ export const ImageSearchModal = ({ downloadImage }) => {
   const onSearchTriggered = async (searchRegistry = "", forceSearch = false, { bypassCache = false } = {}) => {
     setSearchFinished(false);
 
-    const ghLikeRegistry = isGhcr(searchRegistry) || isGhcp(searchRegistry);
-    const targetGhLike = ghLikeRegistry
-      || isGhcrVersaNodeTerm(imageIdentifier)
-      || isGhcpVersaNodeTerm(imageIdentifier);
+    const ghLikeRegistry = isGhcr(searchRegistry);
+    const targetGhLike = ghLikeRegistry || isGhcrVersaNodeTerm(imageIdentifier);
 
-    // Repo term derived from input; strip both ghcp.io and ghcr.io prefixes
+    // Repo term derived from input; strip ghcr.io prefix
     const typedRepo = imageIdentifier
-      .replace(/^ghcp\.io\/?versa-node\/?/i, "")
       .replace(/^ghcr\.io\/?versa-node\/?/i, "")
       .replace(/^versa-node\/?/i, "")
       .trim();
 
     console.debug("[UI] Search triggered:", { searchRegistry, ghLikeRegistry, targetGhLike, typedRepo, forceSearch, imageIdentifier, bypassCache });
 
-    // GH-like (ghcr.io or ghcp.io alias) behavior
+    // GHCR behavior
     if (targetGhLike) {
       setDialogError(""); setDialogErrorDetail("");
       setSearchInProgress(true);
@@ -587,15 +586,8 @@ export const ImageSearchModal = ({ downloadImage }) => {
         const pkgs = await fetchGhcrOrgPackagesViaSpawn({ bypassCache });
         let working = pkgs;
 
-        // If using ghcp.io OR user typed a repo under ghcp/ghcr, filter locally
-        if (isGhcp(searchRegistry) || /^ghcp\.io\//i.test(imageIdentifier) || (typedRepo && isGhcp(selectedRegistry))) {
-          const q = typedRepo.toLowerCase();
-          working = pkgs.filter(p => {
-            const repo = p.name.replace(/^ghcr\.io\/?versa-node\/?/i, "");
-            return repo.toLowerCase().includes(q) || (p.description || "").toLowerCase().includes(q);
-          });
-        } else if (typedRepo.length && isGhcr(searchRegistry)) {
-          // For explicit ghcr.io selection with a repo text, show that single target
+        // If user typed a specific repo under ghcr.io/versa-node, show that one
+        if (typedRepo.length && isGhcr(searchRegistry)) {
           const fullName = buildGhcrVersaNodeName(imageIdentifier);
           working = [{ name: fullName, description: "" }];
         }
@@ -827,7 +819,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
                 <FormSelectOption
                   value={r}
                   key={r}
-                  label={r === "ghcr.io" ? "ghcr.io (versa-node)" : (r === "ghcp.io" ? "ghcp.io (alias, filter)" : r)}
+                  label={r === "ghcr.io" ? "ghcr.io (versa-node)" : r}
                 />
               ))}
             </FormSelect>
@@ -849,7 +841,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
           {imageList.length === 0 && (
             <EmptyStatePanel
               icon={ExclamationCircleIcon}
-              title={cockpit.format(_("No results for $0"), imageIdentifier || (isGhcp(selectedRegistry) ? "GHCP" : "GHCR"))}
+              title={cockpit.format(_("No results for $0"), imageIdentifier || "GHCR")}
               paragraph={_("Retry another term or switch registry.")}
             />
           )}
