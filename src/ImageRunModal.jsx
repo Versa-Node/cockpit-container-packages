@@ -200,6 +200,9 @@ export class ImageRunModal extends React.Component {
 
             const nextState = {};
 
+            console.log("POES1", cfg.Env);
+            console.log("POES2", cfg.Volumes);
+
             if (noUserEnv && Array.isArray(cfg.Env) && cfg.Env.length) {
                 nextState.env = parseEnvVars(cfg.Env);
             }
