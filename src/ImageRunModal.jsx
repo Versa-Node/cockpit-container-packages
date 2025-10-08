@@ -26,7 +26,7 @@ import rest from './rest.js';
 import cockpit from 'cockpit';
 import { onDownloadContainer, onDownloadContainerFinished } from './Containers.jsx';
 import { PublishPort, validatePublishPort } from './PublishPort.jsx';
-import { DynamicListForm } from 'cockpit-components-dynamic-list.jsx';
+import { DynamicListForm } from './cockpit-components-dynamic-list.jsx';
 import { validateVolume, Volume } from './Volume.jsx';
 import { EnvVar, validateEnvVar } from './Env.jsx';
 
