@@ -209,16 +209,6 @@ export class ImageRunModal extends React.Component {
         body: "",
       });
 
-      const inspected = JSON.parse(resp);
-      const cfg = inspected?.Config || {};
-      const envArr = cfg.Env || [];
-      const volObj = cfg.Volumes || {};
-      const exposed = cfg.ExposedPorts || {};
-
-      console.log("[POES1] cfg.Env =", envArr);
-      console.log("[POES2] cfg.Volumes =", volObj);
-      console.log("[POES3] cfg.ExposedPorts =", exposed);
-
       const noUserEnv = !(this.state.env && this.state.env.some(e => e !== undefined));
       const noUserVolumes = !(this.state.volumes && this.state.volumes.some(v => v !== undefined));
       const noUserPublish = !(this.state.publish && this.state.publish.some(p => p !== undefined));
