@@ -174,50 +174,68 @@ export class ImageRunModal extends React.Component {
     /* ----------------------- NEW: load defaults from image ----------------------- */
     // Inspects a local image and, if env/volumes are empty in the form, prefills them from Config
     loadImageDefaults = async (imageRef) => {
-        try {
-            if (!imageRef) return;
+  console.log("[loadImageDefaults] called with:", imageRef);
 
-            // Only attempt when the image is local
-            const isLocal = isLocalImageRef(imageRef, this.props.localImages || []);
-            if (!isLocal) return;
+  if (!imageRef) {
+    console.warn("[loadImageDefaults] no imageRef provided");
+    return;
+  }
 
-            // Prefer an ID, fallback to what we have
-            const ref = (typeof imageRef === "object" && imageRef.Id) ? imageRef.Id : imageRef;
-            const conn = rest.connect(client.getAddress());
+  try {
+    // Resolve an inspectable reference (prefer Id → fallback to name/RepoTags[0])
+    let ref = imageRef;
+    if (typeof imageRef === "object") {
+      ref = imageRef.Id || imageRef.RepoTags?.[0] || imageRef.Name || "";
+    }
+    if (!ref) {
+      console.warn("[loadImageDefaults] could not resolve inspect ref from imageRef");
+      return;
+    }
 
-            const resp = await conn.call({
-                method: "GET",
-                path: client.VERSION + "/images/" + encodeURIComponent(ref) + "/json",
-                body: "",
-            });
+    const conn = rest.connect(client.getAddress());
+    console.log("[loadImageDefaults] inspecting:", ref);
 
-            const inspected = JSON.parse(resp);
-            const cfg = inspected?.Config || {};
+    const resp = await conn.call({
+      method: "GET",
+      path: client.VERSION + "/images/" + encodeURIComponent(ref) + "/json",
+      body: "",
+    });
 
-            // Only prefill if user hasn't added anything yet
-            const noUserEnv = !(this.state.env && this.state.env.some(e => e !== undefined));
-            const noUserVolumes = !(this.state.volumes && this.state.volumes.some(v => v !== undefined));
+    const inspected = JSON.parse(resp);
+    const cfg = inspected?.Config || {};
+    const envArr = cfg.Env || [];
+    const volObj = cfg.Volumes || {};
 
-            const nextState = {};
+    console.log("[POES1] cfg.Env =", envArr);
+    console.log("[POES2] cfg.Volumes =", volObj);
 
-            console.log("POES1", cfg.Env);
-            console.log("POES2", cfg.Volumes);
+    const noUserEnv = !(this.state.env && this.state.env.some(e => e !== undefined));
+    const noUserVolumes = !(this.state.volumes && this.state.volumes.some(v => v !== undefined));
 
-            if (noUserEnv && Array.isArray(cfg.Env) && cfg.Env.length) {
-                nextState.env = parseEnvVars(cfg.Env);
-            }
-            if (noUserVolumes && cfg.Volumes && Object.keys(cfg.Volumes).length) {
-                nextState.volumes = parseVolumes(cfg.Volumes);
-            }
+    const nextState = {};
+    if (noUserEnv && envArr.length) {
+      nextState.env = parseEnvVars(envArr);
+      console.log("[loadImageDefaults] prefilling env:", nextState.env);
+    } else {
+      console.log("[loadImageDefaults] skipping env prefill; user has values or none in image");
+    }
 
-            if (Object.keys(nextState).length) {
-                this.setState(nextState);
-            }
-        } catch (e) {
-            // Silently ignore if inspect fails (e.g., not local yet)
-            // console.debug("loadImageDefaults error", e);
-        }
-    };
+    if (noUserVolumes && volObj && Object.keys(volObj).length) {
+      nextState.volumes = parseVolumes(volObj);
+      console.log("[loadImageDefaults] prefilling volumes:", nextState.volumes);
+    } else {
+      console.log("[loadImageDefaults] skipping volumes prefill; user has values or none in image");
+    }
+
+    if (Object.keys(nextState).length) {
+      this.setState(nextState);
+    }
+  } catch (e) {
+    // Do NOT swallow; log clearly why it failed
+    console.error("[loadImageDefaults] inspect failed; image might not be local yet.", e);
+  }
+};
+
     /* --------------------------------------------------------------------------- */
 
     getCreateConfig() {
