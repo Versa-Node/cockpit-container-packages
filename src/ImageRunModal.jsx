@@ -61,6 +61,42 @@ const buildGhcrVersaNodeName = (txt) => {
   return (GHCR_NAMESPACE + t).replace(/\/+$/, "");
 };
 
+/* -------------------------- NEW HELPERS (defaults) -------------------------- */
+
+// Parse ["KEY=VAL", "FOO=BAR"] -> [{ envKey: "KEY", envValue: "VAL" }, ...]
+function parseEnvVars(arr = []) {
+    return arr.map(line => {
+        const idx = line.indexOf("=");
+        if (idx === -1) return { envKey: line, envValue: "" };
+        return { envKey: line.slice(0, idx), envValue: line.slice(idx + 1) };
+    });
+}
+
+// Convert image Config.Volumes object -> [{ containerPath, hostPath, readOnly }]
+function parseVolumes(volObj = {}) {
+    // Docker image Config.Volumes is like: { "/data": {}, "/cache": {} }
+    return Object.keys(volObj).map(containerPath => ({
+        containerPath,
+        hostPath: null,
+        readOnly: false,
+    }));
+}
+
+// Determine if an image ref is local: compare by Id against local images list
+function isLocalImageRef(imageObjOrName, localImages = []) {
+    if (!imageObjOrName) return false;
+    if (typeof imageObjOrName === "object" && imageObjOrName.Id) {
+        return !!localImages.find(li => li.Id === imageObjOrName.Id);
+    }
+    // If it's a string ref, try to match RepoTags
+    if (typeof imageObjOrName === "string") {
+        return !!localImages.find(li => (li.RepoTags || []).includes(imageObjOrName));
+    }
+    return false;
+}
+
+/* --------------------------------------------------------------------------- */
+
 export class ImageRunModal extends React.Component {
     constructor(props) {
         super(props);
@@ -121,6 +157,11 @@ export class ImageRunModal extends React.Component {
     componentDidMount() {
         this._isMounted = true;
         this.onSearchTriggered(this.state.searchText);
+
+        // NEW: If a local image is provided as prop, prefill defaults
+        if (this.props.image) {
+            this.loadImageDefaults(this.props.image);
+        }
     }
 
     componentWillUnmount() {
@@ -129,6 +170,52 @@ export class ImageRunModal extends React.Component {
         if (this.activeConnection)
             this.activeConnection.close();
     }
+
+    /* ----------------------- NEW: load defaults from image ----------------------- */
+    // Inspects a local image and, if env/volumes are empty in the form, prefills them from Config
+    loadImageDefaults = async (imageRef) => {
+        try {
+            if (!imageRef) return;
+
+            // Only attempt when the image is local
+            const isLocal = isLocalImageRef(imageRef, this.props.localImages || []);
+            if (!isLocal) return;
+
+            // Prefer an ID, fallback to what we have
+            const ref = (typeof imageRef === "object" && imageRef.Id) ? imageRef.Id : imageRef;
+            const conn = rest.connect(client.getAddress());
+
+            const resp = await conn.call({
+                method: "GET",
+                path: client.VERSION + "/images/" + encodeURIComponent(ref) + "/json",
+                body: "",
+            });
+
+            const inspected = JSON.parse(resp);
+            const cfg = inspected?.Config || {};
+
+            // Only prefill if user hasn't added anything yet
+            const noUserEnv = !(this.state.env && this.state.env.some(e => e !== undefined));
+            const noUserVolumes = !(this.state.volumes && this.state.volumes.some(v => v !== undefined));
+
+            const nextState = {};
+
+            if (noUserEnv && Array.isArray(cfg.Env) && cfg.Env.length) {
+                nextState.env = parseEnvVars(cfg.Env);
+            }
+            if (noUserVolumes && cfg.Volumes && Object.keys(cfg.Volumes).length) {
+                nextState.volumes = parseVolumes(cfg.Volumes);
+            }
+
+            if (Object.keys(nextState).length) {
+                this.setState(nextState);
+            }
+        } catch (e) {
+            // Silently ignore if inspect fails (e.g., not local yet)
+            // console.debug("loadImageDefaults error", e);
+        }
+    };
+    /* --------------------------------------------------------------------------- */
 
     getCreateConfig() {
         const createConfig = {};
@@ -494,6 +581,9 @@ export class ImageRunModal extends React.Component {
             isImageSelectOpen: false,
             command,
             entrypoint,
+        }, () => {
+            // NEW: Attempt to prefill defaults if the selected image is local
+            this.loadImageDefaults(value);
         });
     };
 
