@@ -30,6 +30,8 @@ const isGhcr = (reg) => (reg || "").trim().toLowerCase() === "ghcr.io";
 const isGhcrVersaNodeTerm = (term) =>
   /^ghcr\.io\/versa-node\/[^/]+/i.test(term || "") || /^versa-node\/[^/]+/i.test(term || "");
 
+// -------- naming helpers (vncp-…) --------
+
 // Strip registry/org + tag/digest from any image ref
 const stripToRepo = (ref) => {
   if (!ref) return "";
@@ -78,19 +80,16 @@ const parseGhcrRepoName = (full) => {
 };
 
 // -------------------- SIMPLE IN-MEMORY CACHES --------------------
-// (module-level -> persists across component mounts in the same session)
 const ghcrOrgCache = { list: null, at: 0 }; // {list: [{name, description}], at: ts}
 const descCache = new Map(); // key: `${name}@${tag}` -> description
 const tagsCache = new Map(); // key: repo -> [tags]
 const tokenCache = new Map(); // key: repo -> token (string)
 
-// cache helpers
 const now = () => Date.now();
 const MIN = 60 * 1000;
 const isFresh = (ts, maxAgeMs) => ts && (now() - ts) < maxAgeMs;
 
 // -------------------- ORG LIST (GitHub Packages REST) --------------------
-// If token file is missing or not permitted, return an empty list silently.
 async function fetchGhcrOrgPackagesViaSpawn({ bypassCache = false } = {}) {
   if (!bypassCache && ghcrOrgCache.list && isFresh(ghcrOrgCache.at, 10 * MIN)) {
     return ghcrOrgCache.list;
@@ -132,7 +131,7 @@ fi
     const pkgs = JSON.parse(out || "[]");
     const normalized = (pkgs || []).map(p => ({
       name: `ghcr.io/versa-node/${p.name}`,
-      description: (p.description || "").trim(),  // fallback (GitHub package description)
+      description: (p.description || "").trim(),
     }));
     ghcrOrgCache.list = normalized;
     ghcrOrgCache.at = now();
@@ -257,137 +256,88 @@ fi
   }
 }
 
-// -------------------- DESCRIPTION (SIGPIPE-safe, tempfiles, single- or multi-arch) --------------------
+// -------------------- DESCRIPTION (Python-only, no bash functions) --------------------
 async function fetchGhcrOciDescriptionViaSpawn(fullName, tagIn, { bypassCache = false } = {}) {
   const repo = parseGhcrRepoName(fullName);
   let tag = (tagIn || "latest").trim();
   if (!repo) return "";
-  if (!/^[A-Za-z0-9._-]+$/.test(tag)) tag = "latest";
+  if (!/^[A-Za-z0-9._\-:@+]+$/.test(tag)) tag = "latest";
 
   const cacheKey = `${fullName}@${tag}`;
   if (!bypassCache && descCache.has(cacheKey)) return descCache.get(cacheKey) || "";
 
   const token = await ghcrGetRegistryTokenViaSpawn(repo, { bypassCache });
 
-  const script = `
-set -euo pipefail
+  const py = `
+import json, sys, urllib.request
 
-REPO="${repo}"
-TAG="${tag}"
-TOKEN="${token || ""}"
+repo   = ${JSON.stringify(repo)}
+tag    = ${JSON.stringify(tag)}
+token  = ${JSON.stringify(token || "")}
+base   = f"https://ghcr.io/v2/versa-node/{repo}"
 
-UA="User-Agent: versanode-cockpit/1.0"
-ACPT_MAN="Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json"
-ACPT_CFG="Accept: application/vnd.oci.image.config.v1+json, application/vnd.docker.container.image.v1+json"
+def fetch(url, accept):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "versanode-cockpit/1.0",
+        "Docker-Distribution-API-Version": "registry/2.0",
+        "Accept": accept
+    })
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode("utf-8"))
 
-authcurl() {
-  # $1=url, $2=acceptHeader
-  if [ -n "$TOKEN" ]; then
-    curl -fsSL -H "$UA" -H "$2" -H "Docker-Distribution-API-Version: registry/2.0" -H "Authorization: Bearer $TOKEN" "$1"
-  } else {
-    curl -fsSL -H "$UA" -H "$2" -H "Docker-Distribution-API-Version: registry/2.0" "$1"
-  }
-}
+try:
+    man = fetch(f"{base}/manifests/{tag}", ",".join([
+        "application/vnd.oci.image.index.v1+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.docker.distribution.manifest.v2+json"
+    ]))
+    cfg_digest = ""
+    if isinstance(man.get("manifests"), list):
+        chosen = None
+        for e in man["manifests"]:
+            p = e.get("platform") or {}
+            if p.get("os") == "linux" and p.get("architecture") == "arm64":
+                chosen = e
+                break
+        if not chosen and man["manifests"]:
+            chosen = man["manifests"][0]
+        if chosen:
+            sub = fetch(f"{base}/manifests/{chosen.get('digest','')}", ",".join([
+                "application/vnd.oci.image.manifest.v1+json",
+                "application/vnd.docker.distribution.manifest.v2+json"
+            ]))
+            cfg_digest = (sub.get("config") or {}).get("digest", "")
+    else:
+        cfg_digest = (man.get("config") or {}).get("digest", "")
 
-# -- helpers that avoid pipelines (no SIGPIPE) --
-json_is_valid_file() {
-  # $1=path
-  [ -s "$1" ] || return 1
-  python3 - "$1" >/dev/null 2>&1 <<'PY'
-import json,sys
-p=sys.argv[1]
-with open(p,'r',encoding='utf-8',errors='strict') as f:
-    json.load(f)
-PY
-}
+    if not cfg_digest:
+        print("")
+        sys.exit(0)
 
-cfg_digest_from_manifest_file() {
-  python3 - "$1" <<'PY'
-import json,sys
-p=sys.argv[1]
-m=json.load(open(p,'r',encoding='utf-8'))
-print((m.get("config") or {}).get("digest",""))
-PY
-}
-
-select_manifest_digest_from_index_file() {
-  python3 - "$1" <<'PY'
-import json,sys
-p=sys.argv[1]
-m=json.load(open(p,'r',encoding='utf-8'))
-mans=m.get("manifests") or []
-chosen=None
-for e in mans:
-    p=e.get("platform") or {}
-    if p.get("os")=="linux" and p.get("architecture")=="arm64":
-        chosen=e; break
-if not chosen and mans:
-    chosen=mans[0]
-print((chosen or {}).get("digest","") or "")
-PY
-}
-
-media_type_from_file() {
-  python3 - "$1" <<'PY'
-import json,sys
-p=sys.argv[1]
-m=json.load(open(p,'r',encoding='utf-8'))
-print(m.get("mediaType",""))
-PY
-}
-
-desc_from_config_file() {
-  python3 - "$1" <<'PY'
-import json,sys
-p=sys.argv[1]
-cfg=json.load(open(p,'r',encoding='utf-8'))
-labels=(cfg.get("config") or {}).get("Labels") or {}
-print((labels.get("org.opencontainers.image.description","") or "").strip())
-PY
-}
-
-# temp files
-MAN_FILE="$(mktemp)"; SUB_FILE="$(mktemp)"; CFG_FILE="$(mktemp)"
-cleanup() { rm -f "$MAN_FILE" "$SUB_FILE" "$CFG_FILE"; }
-trap cleanup EXIT
-
-# 1) top-level manifest
-MAN_URL="https://ghcr.io/v2/versa-node/$REPO/manifests/$TAG"
-authcurl "$MAN_URL" "$ACPT_MAN" >"$MAN_FILE" || true
-json_is_valid_file "$MAN_FILE" || { echo ""; exit 0; }
-
-TYPE="$(media_type_from_file "$MAN_FILE")"
-
-CFG_DIG=""
-if echo "$TYPE" | grep -qE 'image\\.manifest|manifest\\.v2'; then
-  CFG_DIG="$(cfg_digest_from_manifest_file "$MAN_FILE")"
-else
-  SEL_DIG="$(select_manifest_digest_from_index_file "$MAN_FILE")"
-  [ -n "$SEL_DIG" ] || { echo ""; exit 0; }
-  SUB_URL="https://ghcr.io/v2/versa-node/$REPO/manifests/$SEL_DIG"
-  authcurl "$SUB_URL" "$ACPT_MAN" >"$SUB_FILE" || true
-  json_is_valid_file "$SUB_FILE" || { echo ""; exit 0; }
-  CFG_DIG="$(cfg_digest_from_manifest_file "$SUB_FILE")"
-fi
-
-[ -n "$CFG_DIG" ] || { echo ""; exit 0; }
-
-# 2) fetch config blob and read label
-CFG_URL="https://ghcr.io/v2/versa-node/$REPO/blobs/$CFG_DIG"
-authcurl "$CFG_URL" "$ACPT_CFG" >"$CFG_FILE" || true
-json_is_valid_file "$CFG_FILE" || { echo ""; exit 0; }
-
-desc_from_config_file "$CFG_FILE"
+    cfg = fetch(f"{base}/blobs/{cfg_digest}", ",".join([
+        "application/vnd.oci.image.config.v1+json",
+        "application/vnd.docker.container.image.v1+json"
+    ]))
+    labels = (cfg.get("config") or {}).get("Labels") or {}
+    desc = (labels.get("org.opencontainers.image.description", "") or "").strip()
+    print(desc)
+except Exception:
+    print("")
 `;
 
   try {
-    const out = await cockpit.spawn(["bash", "-lc", script], { superuser: "require", err: "message" });
+    const out = await cockpit.spawn(["bash", "-lc", `python3 - <<'PY'\n${py}\nPY`], { superuser: "require", err: "message" });
     const desc = (out || "").trim();
     descCache.set(cacheKey, desc);
-    console.debug("[GHCR] description (cached)", `${repo}:${tag}`, "=>", desc ? desc.substring(0, 80) + (desc.length > 80 ? "…" : "") : "<empty>");
+    if (desc) {
+      console.debug("[GHCR] description ok for", `${repo}:${tag}`, "=>", desc.substring(0, 80) + (desc.length > 80 ? "…" : ""));
+    }
     return desc;
   } catch (e) {
-    console.warn("[GHCR] fetchGhcrOciDescriptionViaSpawn (sigpipe-safe) failed:", e?.message || e, e);
+    console.warn("[GHCR] fetchGhcrOciDescriptionViaSpawn failed (python):", e?.message || e);
     descCache.set(cacheKey, "");
     return "";
   }
@@ -423,7 +373,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
       ? registries.search
       : fallbackRegistries;
 
-  // only ghcr.io + configured registries
+  // Always put ghcr.io first; de-dupe
   const mergedRegistries = Array.from(new Set(["ghcr.io", ...(baseRegistries || [])]));
 
   const closeActiveConnection = () => {
@@ -569,7 +519,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
     const ghLikeRegistry = isGhcr(searchRegistry);
     const targetGhLike = ghLikeRegistry || isGhcrVersaNodeTerm(imageIdentifier);
 
-    // Repo term derived from input; strip ghcr.io prefix
+    // Repo term derived from input
     const typedRepo = imageIdentifier
       .replace(/^ghcr\.io\/?versa-node\/?/i, "")
       .replace(/^versa-node\/?/i, "")
@@ -586,8 +536,8 @@ export const ImageSearchModal = ({ downloadImage }) => {
         const pkgs = await fetchGhcrOrgPackagesViaSpawn({ bypassCache });
         let working = pkgs;
 
-        // If user typed a specific repo under ghcr.io/versa-node, show that one
         if (typedRepo.length && isGhcr(searchRegistry)) {
+          // For explicit ghcr.io selection with a repo text, show that single target
           const fullName = buildGhcrVersaNodeName(imageIdentifier);
           working = [{ name: fullName, description: "" }];
         }
@@ -676,6 +626,7 @@ export const ImageSearchModal = ({ downloadImage }) => {
     const selectedImageName = imageList[selected].name;
     closeActiveConnection();
     Dialogs.close();
+
     const raw = tagOptions.length > 0
       ? (selectedTag || "latest")
       : ((customTag || "").trim() || "latest");
@@ -684,9 +635,15 @@ export const ImageSearchModal = ({ downloadImage }) => {
     const isDigest = /^@?sha256:[a-f0-9]{64}$/i.test(raw);
     const tagOrDigest = isDigest ? (raw.startsWith('@') ? raw : '@' + raw) : raw;
 
-    console.debug("[UI] Download clicked:", { image: selectedImageName, tagOrDigest });
+    // Local target ref: vncp-<repo>:<tag-or-sha>
+    const localTag = isDigest ? `sha256-${raw.replace(/^@?sha256:/i, "")}` : (raw || "latest");
+    const localRef = `${buildShortLabel(selectedImageName)}:${localTag}`;
+
     const suggestedName = buildSaveName(selectedImageName, tagOrDigest);
-    downloadImage(selectedImageName, tagOrDigest, { saveAs: suggestedName });
+
+    console.debug("[UI] Download clicked:", { image: selectedImageName, tagOrDigest, targetRef: localRef, saveAs: suggestedName });
+    // Keep old signature compatibility + options for retag/saveAs
+    downloadImage(selectedImageName, tagOrDigest, { targetRef: localRef, saveAs: suggestedName });
   };
 
   const handleClose = () => {
