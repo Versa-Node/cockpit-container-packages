@@ -7,137 +7,203 @@ import { HelperText, HelperTextItem } from "@patternfly/react-core/dist/esm/comp
 
 import './cockpit-components-dynamic-list.scss';
 
-/* Dynamic list with a variable number of rows. Each row is a custom component, usually an input field(s).
+/* ============================== DEBUG ============================== */
+const DEBUG_DYNAMIC_LIST = true; // set false to silence
+const DLOG = (...a) => DEBUG_DYNAMIC_LIST && console.log("[DynamicListForm]", ...a);
+const DWARN = (...a) => DEBUG_DYNAMIC_LIST && console.warn("[DynamicListForm]", ...a);
+/* ================================================================== */
+
+/* Utility: shallow-compare arrays of rows, ignoring the auto 'key' field */
+function stripKeys(list = []) {
+  return (list || []).map(r => {
+    if (!r) return r;
+    const { key, ...rest } = r;
+    return rest;
+  });
+}
+function rowsEqualNoKey(a = [], b = []) {
+  try {
+    return JSON.stringify(stripKeys(a)) === JSON.stringify(stripKeys(b));
+  } catch {
+    return false;
+  }
+}
+
+/* Dynamic list with a variable number of rows. Each row is a custom component.
  *
  * Props:
- *   - emptyStateString
- *   - onChange
- *   - id
- *   - itemcomponent (React element type)
- *   - formclass (optional)
- *   - options (optional)
- *   - onValidationChange: A handler function which updates the parent's component's validation object.
- *                         Its parameter is an array the same structure as 'validationFailed'.
- *   - validationFailed: An array where each item represents a validation error of the corresponding row component index.
- *                       A row is strictly mapped to an item of the array by its index.
- *     Example: Let's have a dynamic form, where each row consists of 2 fields: name and email. Then a validation array of
- *              these rows would look like this:
- *     [
- *       { name: "Name must not be empty }, // first row
- *       { }, // second row
- *       { name: "Name cannot contain a number", email: "Email must contain '@'" } // third row
- *     ]
+ *   - id, label, actionLabel, emptyStateString, formclass
+ *   - itemcomponent (React element type), options (optional)
+ *   - onChange(list)  // receives the internal list (with keys)
+ *   - validationFailed, onValidationChange
+ *   - default         // shape for new rows (merged with row data)
+ *   - value           // OPTIONAL controlled initial/next rows [{...},{...}]
  */
 export class DynamicListForm extends React.Component {
-    constructor(props) {
-        super(props);
-        this.state = {
-            list: [],
-        };
-        this.keyCounter = 0;
-        this.removeItem = this.removeItem.bind(this);
-        this.addItem = this.addItem.bind(this);
-        this.onItemChange = this.onItemChange.bind(this);
+  constructor(props) {
+    super(props);
+    this.state = { list: [] };
+    this.keyCounter = 0;
+
+    this.removeItem = this.removeItem.bind(this);
+    this.addItem = this.addItem.bind(this);
+    this.onItemChange = this.onItemChange.bind(this);
+
+    // public helpers for parent debugging / seeding
+    this.seed = this.seed.bind(this);
+    this.getList = this.getList.bind(this);
+  }
+
+  /* Attach auto-increment keys and merge defaults without mutating input */
+  _withKeysFrom = (value = []) => {
+    const out = (value || []).map((row) => ({
+      key: this.keyCounter++,
+      ...(this.props.default || {}),
+      ...(row || {}),
+    }));
+    return out;
+  };
+
+  componentDidMount() {
+    if (Array.isArray(this.props.value)) {
+      const next = this._withKeysFrom(this.props.value);
+      DLOG("mount: adopting props.value ->", next);
+      this.setState({ list: next }, () => this.props.onChange?.(this.state.list));
+    } else {
+      DLOG("mount: no props.value, starting empty");
+    }
+  }
+
+  componentDidUpdate(prevProps, prevState) {
+    // Controlled sync: if props.value changed (by ref OR equal length but different content),
+    // adopt it into our state.list (with fresh keys).
+    if (this.props.value !== prevProps.value) {
+      const next = this._withKeysFrom(this.props.value || []);
+      if (!rowsEqualNoKey(next, this.state.list)) {
+        DLOG("props.value changed -> syncing into state", { prevLen: prevState.list.length, nextLen: next.length });
+        this.setState({ list: next }, () => this.props.onChange?.(this.state.list));
+      } else {
+        DLOG("props.value changed (ref) but rows identical; skipping state update");
+      }
     }
 
-    removeItem(idx) {
-        const validationFailedDelta = this.props.validationFailed ? [...this.props.validationFailed] : [];
-        // We also need to remove any error messages which the item (row) may have contained
-        delete validationFailedDelta[idx];
-        this.props.onValidationChange?.(validationFailedDelta);
-
-        this.setState(state => {
-            const items = [...state.list];
-            // keep the list structure, otherwise all the indexes shift and the ID/key mapping gets broken
-            delete items[idx];
-
-            return { list: items };
-        }, () => this.props.onChange(this.state.list));
+    // Log structural changes for visibility
+    if (!rowsEqualNoKey(prevState.list, this.state.list)) {
+      DLOG("state.list changed",
+        { prevLen: prevState.list?.length || 0, nextLen: this.state.list?.length || 0 },
+        { prev: stripKeys(prevState.list), next: stripKeys(this.state.list) }
+      );
     }
+  }
 
-    addItem() {
-        this.setState(state => {
-            return { list: [...state.list, { key: this.keyCounter++, ...this.props.default }] };
-        }, () => this.props.onChange(this.state.list));
-    }
+  /* Public: force-load rows (used by parent hacks/tests) */
+  seed(rows = []) {
+    const next = this._withKeysFrom(rows);
+    DLOG("seed() called with", rows, " -> adopting as ", next);
+    this.setState({ list: next }, () => this.props.onChange?.(this.state.list));
+  }
 
-    onItemChange(idx, field, value) {
-        this.setState(state => {
-            const items = [...state.list];
-            items[idx][field] = value || null;
-            return { list: items };
-        }, () => this.props.onChange(this.state.list));
-    }
+  /* Public: quick accessor for parent console checks */
+  getList() {
+    return this.state.list;
+  }
 
-    render () {
-        const { id, label, actionLabel, formclass, emptyStateString, helperText, validationFailed, onValidationChange } = this.props;
-        const dialogValues = this.state;
-        return (
-            <FormFieldGroup header={
-                <FormFieldGroupHeader
-                    titleText={{ text: label }}
-                    actions={<Button variant="secondary" className="btn-add" onClick={this.addItem}>{actionLabel}</Button>}
-                />
-            } className={"dynamic-form-group " + formclass}>
-                {
-                    dialogValues.list.some(item => item !== undefined)
-                        ? <>
-                            {dialogValues.list.map((item, idx) => {
-                                if (item === undefined)
-                                    return null;
+  removeItem(idx) {
+    const validationFailedDelta = this.props.validationFailed ? [...this.props.validationFailed] : [];
+    delete validationFailedDelta[idx];
+    this.props.onValidationChange?.(validationFailedDelta);
 
-                                return React.createElement(this.props.itemcomponent, {
-                                    idx,
-                                    item,
-                                    id: id + "-" + idx,
-                                    key: idx,
-                                    onChange: this.onItemChange,
-                                    removeitem: this.removeItem,
-                                    additem: this.addItem,
-                                    options: this.props.options,
-                                    validationFailed: validationFailed && validationFailed[idx],
-                                    onValidationChange: value => {
-                                        // Dynamic list consists of multiple rows. Therefore validationFailed object is presented as an array where each item represents a row
-                                        // Each row/item then consists of key-value pairs, which represent a field name and it's validation error
-                                        const delta = validationFailed ? [...validationFailed] : [];
-                                        // Update validation of only a single row
-                                        delta[idx] = value;
+    this.setState(state => {
+      const items = [...state.list];
+      DLOG("removeItem", { idx, beforeLen: items.length, removing: items[idx] });
+      delete items[idx]; // keep holes to preserve mapping
+      return { list: items };
+    }, () => this.props.onChange?.(this.state.list));
+  }
 
-                                        // If a row doesn't contain any fields with errors anymore, we delete the item of the array
-                                        // Deleting an item of an array replaces an item with an "empty item".
-                                        // This guarantees that an array of validation errors maps to the correct rows
-                                        if (Object.keys(delta[idx]).length == 0)
-                                            delete delta[idx];
+  addItem() {
+    this.setState(state => {
+      const newRow = { key: this.keyCounter++, ...(this.props.default || {}) };
+      DLOG("addItem", newRow);
+      return { list: [...state.list, newRow] };
+    }, () => this.props.onChange?.(this.state.list));
+  }
 
-                                        onValidationChange?.(delta);
-                                    },
-                                });
-                            })
-                            }
-                            {helperText &&
-                            <HelperText>
-                                <HelperTextItem>{helperText}</HelperTextItem>
-                            </HelperText>
-                            }
-                        </>
-                        : <EmptyState>
-                            <EmptyStateBody>
-                                {emptyStateString}
-                            </EmptyStateBody>
-                        </EmptyState>
+  onItemChange(idx, field, value) {
+    this.setState(state => {
+      const items = [...state.list];
+      if (!items[idx]) {
+        DWARN("onItemChange on empty slot", { idx, field, value });
+        items[idx] = { key: this.keyCounter++, ...(this.props.default || {}) };
+      }
+      items[idx][field] = value || null;
+      DLOG("onItemChange", { idx, field, value, row: items[idx] });
+      return { list: items };
+    }, () => this.props.onChange?.(this.state.list));
+  }
+
+  render () {
+    const { id, label, actionLabel, formclass, emptyStateString, helperText, validationFailed, onValidationChange } = this.props;
+    const dialogValues = this.state;
+
+    return (
+      <FormFieldGroup
+        header={
+          <FormFieldGroupHeader
+            titleText={{ text: label }}
+            actions={<Button variant="secondary" className="btn-add" onClick={this.addItem}>{actionLabel}</Button>}
+          />
+        }
+        className={"dynamic-form-group " + (formclass || "")}
+      >
+        {
+          dialogValues.list.some(item => item !== undefined)
+            ? <>
+                {dialogValues.list.map((item, idx) => {
+                  if (item === undefined) return null;
+
+                  return React.createElement(this.props.itemcomponent, {
+                    idx,
+                    item,
+                    id: id + "-" + idx,
+                    key: item.key ?? idx,          // prefer stable key
+                    onChange: this.onItemChange,
+                    removeitem: this.removeItem,
+                    additem: this.addItem,
+                    options: this.props.options,
+                    validationFailed: validationFailed && validationFailed[idx],
+                    onValidationChange: value => {
+                      const delta = validationFailed ? [...validationFailed] : [];
+                      delta[idx] = value;
+                      if (Object.keys(delta[idx] || {}).length === 0) delete delta[idx];
+                      onValidationChange?.(delta);
+                    },
+                  });
+                })}
+                {helperText &&
+                  <HelperText>
+                    <HelperTextItem>{helperText}</HelperTextItem>
+                  </HelperText>
                 }
-            </FormFieldGroup>
-        );
-    }
+              </>
+            : <EmptyState>
+                <EmptyStateBody>{emptyStateString}</EmptyStateBody>
+              </EmptyState>
+        }
+      </FormFieldGroup>
+    );
+  }
 }
 
 DynamicListForm.propTypes = {
-    emptyStateString: PropTypes.string.isRequired,
-    onChange: PropTypes.func.isRequired,
-    id: PropTypes.string.isRequired,
-    itemcomponent: PropTypes.elementType.isRequired,
-    formclass: PropTypes.string,
-    options: PropTypes.object,
-    validationFailed: PropTypes.array,
-    onValidationChange: PropTypes.func,
+  emptyStateString: PropTypes.string.isRequired,
+  onChange: PropTypes.func.isRequired,
+  id: PropTypes.string.isRequired,
+  itemcomponent: PropTypes.elementType.isRequired,
+  formclass: PropTypes.string,
+  options: PropTypes.object,
+  validationFailed: PropTypes.array,
+  onValidationChange: PropTypes.func,
+  default: PropTypes.object,
+  value: PropTypes.array,     // <-- new: controlled list support
 };
