@@ -1050,7 +1050,7 @@ export class ImageRunModal extends React.Component {
                             onChange={value => this.onValueChanged('publish', value)}
                             value={dialogValues.publish}      // ← hydrate from here
                             default={{ IP: null, containerPort: null, hostPort: null, protocol: 'tcp' }}
-                            itemcomponent={<PublishPort />}
+                            itemcomponent={PublishPort}
                         />
 
                         <DynamicListForm
@@ -1066,7 +1066,7 @@ export class ImageRunModal extends React.Component {
                             value={dialogValues.volumes}     // ← hydrate from here
                             default={{ containerPath: null, hostPath: null, readOnly: false }}
                             options={{ selinuxAvailable }}
-                            itemcomponent={<Volume />}
+                            itemcomponent={Volume}
                         />
 
                         <DynamicListForm
@@ -1082,7 +1082,7 @@ export class ImageRunModal extends React.Component {
                             value={dialogValues.env}         // ← hydrate from here
                             default={{ envKey: null, envValue: null }}
                             helperText={_("Paste one or more lines of key=value pairs into any field for bulk import")}
-                            itemcomponent={<EnvVar />}
+                            itemcomponent={EnvVar}
                         />
                     </Tab>
 

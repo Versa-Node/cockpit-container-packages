@@ -7,201 +7,209 @@ import { HelperText, HelperTextItem } from "@patternfly/react-core/dist/esm/comp
 
 import './cockpit-components-dynamic-list.scss';
 
-/* Dynamic list with a variable number of rows. Each row is a custom component, usually input field(s).
- *
- * Props:
- *   - emptyStateString
- *   - onChange(list)
- *   - id
- *   - itemcomponent (React element type)
- *   - formclass (optional)
- *   - options (optional)
- *   - onValidationChange: A handler function which updates the parent's validation object.
- *                         Parameter is an array with the same structure as 'validationFailed'.
- *   - validationFailed: Array; each item represents validation result for the row at the same index.
- *   - default: shape of a brand-new row when clicking "Add"
- *   - value: initial/controlled list to render (NEW)  ←––––––––––––––––––––––––––––––––––––––
- */
+function dbg(id) { return `[DynamicListForm:${id}]`; }
+function summarize(list, max = 5) {
+  if (!Array.isArray(list)) return list;
+  const out = [];
+  for (let i = 0; i < Math.min(list.length, max); i++) {
+    const it = list[i];
+    out.push(it === undefined ? { idx: i, deleted: true } : { idx: i, key: it?.key, ...it });
+  }
+  if (list.length > max) out.push({ more: list.length - max });
+  return out;
+}
+
+// Normalize itemcomponent so we always have a valid “type” for React.createElement
+function resolveItemType(ic) {
+  // Already a valid React element? unwrap to its component type
+  if (React.isValidElement(ic)) {
+    return ic.type;
+  }
+  // A function/class component or a special React type (memo/forwardRef objects) is fine
+  if (typeof ic === 'function' || (ic && typeof ic === 'object' && ic.$$typeof)) {
+    return ic;
+  }
+  return null;
+}
+
+/* Dynamic list with a variable number of rows. */
 export class DynamicListForm extends React.Component {
-    constructor(props) {
-        super(props);
+  constructor(props) {
+    super(props);
 
-        // Build initial list from props.value if provided; otherwise empty list.
-        const { list, nextKey } = this._hydrateFromValue(props.value, 0, props.id);
-        this.state = {
-            list,           // [{ key, ...rowFields }, ...] holes allowed (deleted rows)
-            keyCounter: nextKey,
-        };
+    const { list, nextKey } = this._hydrateFromValue(props.value, 0, props.id);
+    this.state = { list, keyCounter: nextKey };
 
-        this.removeItem = this.removeItem.bind(this);
-        this.addItem = this.addItem.bind(this);
-        this.onItemChange = this.onItemChange.bind(this);
+    this.removeItem = this.removeItem.bind(this);
+    this.addItem = this.addItem.bind(this);
+    this.onItemChange = this.onItemChange.bind(this);
 
-        console.log(`[DynamicListForm:${props.id}] ctor -> value len: ${Array.isArray(props.value) ? props.value.length : 0}`);
+    console.groupCollapsed(`${dbg(props.id)} ctor`);
+    console.log('props.value len:', Array.isArray(props.value) ? props.value.length : '(not array)');
+    console.log('props.value sample:', summarize(props.value));
+    console.log('state.list len:', list.filter(Boolean).length);
+    console.groupEnd();
+  }
+
+  _hydrateFromValue(value, startKey, idForLog) {
+    const out = [];
+    let k = startKey;
+    if (Array.isArray(value) && value.length > 0) {
+      value.forEach((row, idx) => {
+        if (row === undefined || row === null) { out[idx] = undefined; return; }
+        const withKey = { ...(row || {}) };
+        if (withKey.key === undefined) withKey.key = k++;
+        out[idx] = withKey;
+      });
+    }
+    console.log(`${dbg(idForLog)} hydrateFromValue -> rows: ${out.filter(Boolean).length}`, summarize(out));
+    return { list: out, nextKey: k };
+  }
+
+  componentDidMount() {
+    console.log(`${dbg(this.props.id)} mounted list len:`, this.state.list.filter(Boolean).length);
+    if (Array.isArray(this.props.value) && this.props.value.length > 0 && this.state.list.filter(Boolean).length === 0) {
+      const { list, nextKey } = this._hydrateFromValue(this.props.value, this.state.keyCounter, this.props.id);
+      this.setState({ list, keyCounter: nextKey }, () => {
+        console.log(`${dbg(this.props.id)} didMount sync -> list len:`, this.state.list.filter(Boolean).length);
+        this.props.onChange?.(this.state.list);
+      });
+    }
+  }
+
+  componentDidUpdate(prevProps) {
+    const valueChanged =
+      this.props.value !== prevProps.value ||
+      (Array.isArray(this.props.value) && Array.isArray(prevProps.value) &&
+        this.props.value.length !== prevProps.value.length);
+
+    if (valueChanged) {
+      console.groupCollapsed(`${dbg(this.props.id)} props.value changed`);
+      console.log('prev len:', Array.isArray(prevProps.value) ? prevProps.value.length : '(na)', 'next len:', Array.isArray(this.props.value) ? this.props.value.length : '(na)');
+      const { list, nextKey } = this._hydrateFromValue(this.props.value, this.state.keyCounter, this.props.id);
+      this.setState({ list, keyCounter: nextKey }, () => {
+        console.log('synced state.list len:', this.state.list.filter(Boolean).length, summarize(this.state.list));
+        console.groupEnd();
+        this.props.onChange?.(this.state.list);
+      });
+    }
+  }
+
+  removeItem(idx) {
+    const validationFailedDelta = this.props.validationFailed ? [...this.props.validationFailed] : [];
+    delete validationFailedDelta[idx];
+    this.props.onValidationChange?.(validationFailedDelta);
+
+    this.setState(state => {
+      const items = [...state.list];
+      delete items[idx];
+      return { list: items };
+    }, () => {
+      console.log(`${dbg(this.props.id)} removeItem(${idx}) -> non-empty len:`, this.state.list.filter(Boolean).length);
+      this.props.onChange?.(this.state.list);
+    });
+  }
+
+  addItem() {
+    this.setState(state => {
+      const next = { key: state.keyCounter, ...(this.props.default || {}) };
+      return { list: [...state.list, next], keyCounter: state.keyCounter + 1 };
+    }, () => {
+      console.log(`${dbg(this.props.id)} addItem -> len:`, this.state.list.filter(Boolean).length);
+      this.props.onChange?.(this.state.list);
+    });
+  }
+
+  onItemChange(idx, field, value) {
+    this.setState(state => {
+      const items = [...state.list];
+      if (!items[idx]) items[idx] = { key: state.keyCounter, ...(this.props.default || {}) };
+      if (items[idx].key === undefined) items[idx].key = state.keyCounter;
+      items[idx][field] = (value === undefined ? null : value);
+      const nextKey = (items[idx].key === state.keyCounter) ? state.keyCounter + 1 : state.keyCounter;
+      return { list: items, keyCounter: nextKey };
+    }, () => {
+      console.log(`${dbg(this.props.id)} onItemChange idx=${idx}, field=${field} ->`, this.state.list[idx]);
+      this.props.onChange?.(this.state.list);
+    });
+  }
+
+  render () {
+    const { id, label, actionLabel, formclass, emptyStateString, helperText, validationFailed, onValidationChange } = this.props;
+    const { list } = this.state;
+
+    const ItemType = resolveItemType(this.props.itemcomponent);
+    if (!ItemType) {
+      console.error(`${dbg(id)} Invalid itemcomponent provided:`, this.props.itemcomponent);
+    } else {
+      const labelName = (ItemType && (ItemType.displayName || ItemType.name)) || typeof ItemType;
+      console.log(`${dbg(id)} resolved itemcomponent ->`, labelName);
     }
 
-    /* Convert props.value (array of row objects) into our internal list that
-       includes stable `key`s. Keeps existing keys if present; otherwise assigns. */
-    _hydrateFromValue(value, startKey, idForLog) {
-        const out = [];
-        let k = startKey;
+    const hasAny = list.some(item => item !== undefined);
 
-        if (Array.isArray(value) && value.length > 0) {
-            value.forEach((row, idx) => {
-                if (row === undefined || row === null) {
-                    out[idx] = undefined; // preserve "holes"
-                    return;
+    return (
+      <FormFieldGroup header={
+        <FormFieldGroupHeader
+          titleText={{ text: label }}
+          actions={<Button variant="secondary" className="btn-add" onClick={this.addItem}>{actionLabel}</Button>}
+        />
+      } className={"dynamic-form-group " + (formclass || "")}>
+        {
+          hasAny
+            ? <>
+              {list.map((item, idx) => {
+                if (item === undefined) return null;
+                if (!ItemType) return null;
+                try {
+                  return React.createElement(ItemType, {
+                    idx,
+                    item,
+                    id: id + "-" + idx,
+                    key: item.key ?? idx,
+                    onChange: this.onItemChange,
+                    removeitem: this.removeItem,
+                    additem: this.addItem,
+                    options: this.props.options,
+                    validationFailed: validationFailed && validationFailed[idx],
+                    onValidationChange: value => {
+                      const delta = validationFailed ? [...validationFailed] : [];
+                      delta[idx] = value;
+                      if (Object.keys(delta[idx] || {}).length === 0) delete delta[idx];
+                      onValidationChange?.(delta);
+                    },
+                  });
+                } catch (e) {
+                  console.error(`${dbg(id)} row render failed at idx=${idx}`, { error: e, item, ItemType });
+                  return null;
                 }
-                const withKey = { ...(row || {}) };
-                if (withKey.key === undefined) withKey.key = k++;
-                out[idx] = withKey;
-            });
+              })}
+              {helperText &&
+                <HelperText>
+                  <HelperTextItem>{helperText}</HelperTextItem>
+                </HelperText>
+              }
+            </>
+            : <EmptyState>
+              <EmptyStateBody>
+                {emptyStateString}
+              </EmptyStateBody>
+            </EmptyState>
         }
-
-        console.log(`[DynamicListForm:${idForLog}] hydrateFromValue -> rows: ${out.filter(Boolean).length}`);
-        return { list: out, nextKey: k };
-    }
-
-    componentDidMount() {
-        console.log(`[DynamicListForm:${this.props.id}] mounted with list length: ${this.state.list.filter(Boolean).length}`);
-        // If a value prop exists and we didn’t reflect it (e.g. because it arrived late),
-        // try to sync once on mount — safe no-op if already in sync.
-        if (Array.isArray(this.props.value) && this.props.value.length > 0 && this.state.list.filter(Boolean).length === 0) {
-            const { list, nextKey } = this._hydrateFromValue(this.props.value, this.state.keyCounter, this.props.id);
-            this.setState({ list, keyCounter: nextKey }, () => {
-                console.log(`[DynamicListForm:${this.props.id}] didMount sync -> list length: ${this.state.list.filter(Boolean).length}`);
-                this.props.onChange?.(this.state.list);
-            });
-        }
-    }
-
-    componentDidUpdate(prevProps) {
-        // Basic controlled sync: if parent changes `value` reference (or length), mirror it.
-        const valueChanged =
-            this.props.value !== prevProps.value ||
-            (Array.isArray(this.props.value) && Array.isArray(prevProps.value) &&
-             this.props.value.length !== prevProps.value.length);
-
-        if (valueChanged) {
-            const { list, nextKey } = this._hydrateFromValue(this.props.value, this.state.keyCounter, this.props.id);
-            this.setState({ list, keyCounter: nextKey }, () => {
-                console.log(`[DynamicListForm:${this.props.id}] props.value changed -> list length: ${this.state.list.filter(Boolean).length}`);
-                this.props.onChange?.(this.state.list);
-            });
-        }
-    }
-
-    removeItem(idx) {
-        const validationFailedDelta = this.props.validationFailed ? [...this.props.validationFailed] : [];
-        // We also need to remove any error messages which the item (row) may have contained
-        delete validationFailedDelta[idx];
-        this.props.onValidationChange?.(validationFailedDelta);
-
-        this.setState(state => {
-            const items = [...state.list];
-            // keep the list structure (sparse), otherwise indexes shift and key mapping breaks
-            delete items[idx];
-            return { list: items };
-        }, () => {
-            console.log(`[DynamicListForm:${this.props.id}] removeItem(${idx}) -> new length (non-empty): ${this.state.list.filter(Boolean).length}`);
-            this.props.onChange?.(this.state.list);
-        });
-    }
-
-    addItem() {
-        this.setState(state => {
-            const next = { key: state.keyCounter, ...(this.props.default || {}) };
-            return { list: [...state.list, next], keyCounter: state.keyCounter + 1 };
-        }, () => {
-            console.log(`[DynamicListForm:${this.props.id}] addItem -> length now: ${this.state.list.filter(Boolean).length}`);
-            this.props.onChange?.(this.state.list);
-        });
-    }
-
-    onItemChange(idx, field, value) {
-        this.setState(state => {
-            const items = [...state.list];
-            if (!items[idx]) items[idx] = { key: state.keyCounter, ...(this.props.default || {}) };
-            if (items[idx].key === undefined) items[idx].key = state.keyCounter;
-            items[idx][field] = (value === undefined ? null : value);
-            const nextKey = (items[idx].key === state.keyCounter) ? state.keyCounter + 1 : state.keyCounter;
-            return { list: items, keyCounter: nextKey };
-        }, () => {
-            // Emit full list with holes preserved
-            console.log(`[DynamicListForm:${this.props.id}] onItemChange idx=${idx}, field=${field} ->`, this.state.list[idx]);
-            this.props.onChange?.(this.state.list);
-        });
-    }
-
-    render () {
-        const { id, label, actionLabel, formclass, emptyStateString, helperText, validationFailed, onValidationChange } = this.props;
-        const { list } = this.state;
-
-        const hasAny = list.some(item => item !== undefined);
-
-        return (
-            <FormFieldGroup header={
-                <FormFieldGroupHeader
-                    titleText={{ text: label }}
-                    actions={<Button variant="secondary" className="btn-add" onClick={this.addItem}>{actionLabel}</Button>}
-                />
-            } className={"dynamic-form-group " + (formclass || "")}>
-                {
-                    hasAny
-                        ? <>
-                            {list.map((item, idx) => {
-                                if (item === undefined) return null;
-
-                                return React.createElement(this.props.itemcomponent, {
-                                    idx,
-                                    item,
-                                    id: id + "-" + idx,
-                                    key: item.key ?? idx, // prefer stable internal key
-                                    onChange: this.onItemChange,
-                                    removeitem: this.removeItem,
-                                    additem: this.addItem,
-                                    options: this.props.options,
-                                    validationFailed: validationFailed && validationFailed[idx],
-                                    onValidationChange: value => {
-                                        // Each row/item then consists of key-value pairs, which represent a field name and its validation error
-                                        const delta = validationFailed ? [...validationFailed] : [];
-                                        // Update validation of only a single row
-                                        delta[idx] = value;
-
-                                        // If a row doesn't contain any fields with errors anymore, delete the item of the array (keep holes)
-                                        if (Object.keys(delta[idx] || {}).length === 0)
-                                            delete delta[idx];
-
-                                        onValidationChange?.(delta);
-                                    },
-                                });
-                            })}
-                            {helperText &&
-                                <HelperText>
-                                    <HelperTextItem>{helperText}</HelperTextItem>
-                                </HelperText>
-                            }
-                        </>
-                        : <EmptyState>
-                            <EmptyStateBody>
-                                {emptyStateString}
-                            </EmptyStateBody>
-                        </EmptyState>
-                }
-            </FormFieldGroup>
-        );
-    }
+      </FormFieldGroup>
+    );
+  }
 }
 
 DynamicListForm.propTypes = {
-    emptyStateString: PropTypes.string.isRequired,
-    onChange: PropTypes.func.isRequired,
-    id: PropTypes.string.isRequired,
-    itemcomponent: PropTypes.elementType.isRequired,
-    formclass: PropTypes.string,
-    options: PropTypes.object,
-    validationFailed: PropTypes.array,
-    onValidationChange: PropTypes.func,
-    default: PropTypes.object,
-    value: PropTypes.array, // NEW
+  emptyStateString: PropTypes.string.isRequired,
+  onChange: PropTypes.func.isRequired,
+  id: PropTypes.string.isRequired,
+  itemcomponent: PropTypes.oneOfType([PropTypes.elementType, PropTypes.element]).isRequired,
+  formclass: PropTypes.string,
+  options: PropTypes.object,
+  validationFailed: PropTypes.array,
+  onValidationChange: PropTypes.func,
+  default: PropTypes.object,
+  value: PropTypes.array,
 };
