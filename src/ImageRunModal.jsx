@@ -1,3 +1,4 @@
+// ImageRunModal.jsx
 import React from 'react';
 import { Button } from "@patternfly/react-core/dist/esm/components/Button";
 import { Checkbox } from "@patternfly/react-core/dist/esm/components/Checkbox";
@@ -36,12 +37,56 @@ import "./ImageRunModal.scss";
 
 const _ = cockpit.gettext;
 
-/* ============================== DEBUG ============================== */
-const DEBUG_RUN_MODAL = true; // set false to silence
-const LOG  = (...a) => DEBUG_RUN_MODAL && console.log("[ImageRunModal]", ...a);
-const WARN = (...a) => DEBUG_RUN_MODAL && console.warn("[ImageRunModal]", ...a);
-const ERR  = (...a) => DEBUG_RUN_MODAL && console.error("[ImageRunModal]", ...a);
-/* ================================================================== */
+/* ------------------------ helpers for prefill ------------------------ */
+
+// env: ["KEY=VAL", "FOO=BAR"] -> [{ envKey, envValue }]
+function parseEnvVars(arr = []) {
+  return arr.map(line => {
+    const idx = line.indexOf("=");
+    if (idx === -1) return { envKey: line, envValue: "" };
+    return { envKey: line.slice(0, idx), envValue: line.slice(idx + 1) };
+  });
+}
+
+// volumes: { "/path/in/container": {} } -> [{ containerPath, hostPath:null, readOnly:false }]
+function parseVolumes(volObj = {}) {
+  return Object.keys(volObj || {}).map(containerPath => ({
+    containerPath,
+    hostPath: null,
+    readOnly: false,
+  }));
+}
+
+// exposed ports: { "8080/tcp": {}, "9000/udp": {} } -> [{ IP:null, containerPort:"8080", hostPort:null, protocol:"tcp" }, ...]
+function parseExposedPorts(exposed = {}) {
+  return Object.keys(exposed || {}).map(k => {
+    const [port, proto] = k.split("/");
+    return { IP: null, containerPort: port, hostPort: null, protocol: (proto || "tcp").toLowerCase() };
+  });
+}
+
+// local image detection (by Id)
+function isLocalImageRef(imageObjOrName, localImages = []) {
+  if (!imageObjOrName) return false;
+  if (typeof imageObjOrName === "object" && imageObjOrName.Id) {
+    return !!localImages.find(li => li.Id === imageObjOrName.Id);
+  }
+  if (typeof imageObjOrName === "string") {
+    return !!localImages.find(li => (li.RepoTags || []).includes(imageObjOrName));
+  }
+  return false;
+}
+
+// ---- GHCR helpers (versa-node) ----
+const GHCR_NAMESPACE = "ghcr.io/versa-node/";
+const isGhcrVersaNodeTerm = (term) =>
+  /^ghcr\.io\/versa-node\/[^/]+/i.test(term || "") || /^versa-node\/[^/]+/i.test(term || "");
+const buildGhcrVersaNodeName = (txt) => {
+  const t = (txt || "").trim()
+    .replace(/^ghcr\.io\/?/i, "")
+    .replace(/^versa-node\/?/i, "");
+  return (GHCR_NAMESPACE + t).replace(/\/+$/, "");
+};
 
 const units = {
   KB: { name: "KB", baseExponent: 1 },
@@ -56,64 +101,6 @@ const HealthCheckOnFailureActionOrder = [
   { value: 4, label: _("Stop") },
   { value: 2, label: _("Force stop") },
 ];
-
-// ---- GHCR helpers (versa-node) ----
-const GHCR_NAMESPACE = "ghcr.io/versa-node/";
-const isGhcrVersaNodeTerm = (term) =>
-  /^ghcr\.io\/versa-node\/[^/]+/i.test(term || "") || /^versa-node\/[^/]+/i.test(term || "");
-const buildGhcrVersaNodeName = (txt) => {
-  const t = (txt || "").trim()
-    .replace(/^ghcr\.io\/?/i, "")
-    .replace(/^versa-node\/?/i, "");
-  return (GHCR_NAMESPACE + t).replace(/\/+$/, "");
-};
-
-/* ------------------------ helpers for prefill ------------------------ */
-
-// env: ["KEY=VAL"] -> [{ envKey, envValue }]
-function parseEnvVars(arr = []) {
-  const out = arr.map(line => {
-    const idx = line.indexOf("=");
-    if (idx === -1) return { envKey: line, envValue: "" };
-    return { envKey: line.slice(0, idx), envValue: line.slice(idx + 1) };
-  });
-  LOG("parsed Env ->", out);
-  return out;
-}
-
-// volumes: { "/in/container": {} } -> [{ containerPath, hostPath:null, readOnly:false }]
-function parseVolumes(volObj = {}) {
-  const out = Object.keys(volObj || {}).map(containerPath => ({
-    containerPath,
-    hostPath: null,
-    readOnly: false,
-  }));
-  LOG("parsed Volumes ->", out);
-  return out;
-}
-
-// exposed ports: { "8080/tcp": {} } -> [{ IP:null, containerPort:8080, hostPort:null, protocol:"tcp" }]
-function parseExposedPorts(exposed = {}) {
-  const out = Object.keys(exposed || {}).map(k => {
-    const [port, proto] = k.split("/");
-    const num = parseInt(port, 10);
-    return { IP: null, containerPort: Number.isFinite(num) ? num : port, hostPort: null, protocol: (proto || "tcp").toLowerCase() };
-  });
-  LOG("parsed ExposedPorts ->", out);
-  return out;
-}
-
-// local image detection (by Id or RepoTags)
-function isLocalImageRef(imageObjOrName, localImages = []) {
-  if (!imageObjOrName) return false;
-  if (typeof imageObjOrName === "object" && imageObjOrName.Id) {
-    return !!(localImages || []).find(li => li.Id === imageObjOrName.Id);
-  }
-  if (typeof imageObjOrName === "string") {
-    return !!(localImages || []).find(li => (li.RepoTags || []).includes(imageObjOrName));
-  }
-  return false;
-}
 
 export class ImageRunModal extends React.Component {
   constructor(props) {
@@ -168,16 +155,19 @@ export class ImageRunModal extends React.Component {
       healthcheck_action: 0,
       /* prefill */
       prefillLoading: false,
+      prefillReady: false,
       prefillNonce: 0, // bump to force DynamicListForm remount
     };
+
     this.getCreateConfig = this.getCreateConfig.bind(this);
     this.onValueChanged = this.onValueChanged.bind(this);
   }
 
   componentDidMount() {
     this._isMounted = true;
-    LOG("mounted. props.image =", this.props.image, " localImages=", this.props.localImages?.length);
     this.onSearchTriggered(this.state.searchText);
+
+    // Prefill from local image (if dialog opened from an image row)
     if (this.props.image) {
       this.loadImageDefaults(this.props.image);
     }
@@ -185,7 +175,8 @@ export class ImageRunModal extends React.Component {
 
   componentWillUnmount() {
     this._isMounted = false;
-    if (this.activeConnection) this.activeConnection.close();
+    if (this.activeConnection)
+      this.activeConnection.close();
   }
 
   /* ---------------------- inspect + prefill from image ---------------------- */
@@ -193,15 +184,15 @@ export class ImageRunModal extends React.Component {
     try {
       if (!imageRef) return;
 
-      // resolve inspect ref
       let ref = imageRef;
       if (typeof imageRef === "object") {
         ref = imageRef.Id || imageRef.RepoTags?.[0] || imageRef.Name || "";
       }
       if (!ref) return;
 
-      LOG("loadImageDefaults: inspecting", ref);
-      this.setState({ prefillLoading: true });
+      // mark waiting & disable actions
+      this.setState({ prefillLoading: true, prefillReady: false });
+      console.log("[ImageRunModal] prefill: starting inspect for ref:", ref);
 
       const conn = rest.connect(client.getAddress());
       const resp = await conn.call({
@@ -212,48 +203,60 @@ export class ImageRunModal extends React.Component {
 
       const inspected = JSON.parse(resp);
       const cfg = inspected?.Config || {};
-      const envArr = cfg.Env || [];
+      const containerCfg = inspected?.ContainerConfig || {};
+
+      console.log("[ImageRunModal] inspect Config keys:", Object.keys(cfg || {}));
+      console.log("[ImageRunModal] inspect ContainerConfig keys:", Object.keys(containerCfg || {}));
+
+      // Source fields:
+      const envArr = Array.isArray(cfg.Env) ? cfg.Env : [];
       const volObj = cfg.Volumes || {};
-      const exposed = cfg.ExposedPorts || inspected?.ContainerConfig?.ExposedPorts || {};
+      // ExposedPorts may not exist on many images
+      let exposed = cfg.ExposedPorts || containerCfg.ExposedPorts || {};
 
-      LOG("inspect result: Config keys ->", Object.keys(cfg));
-      LOG("inspect Env raw:", envArr);
-      LOG("inspect Volumes raw:", volObj);
-      LOG("inspect ExposedPorts raw:", exposed);
+      if (!cfg.ExposedPorts && !containerCfg.ExposedPorts) {
+        console.log("[ImageRunModal] no ExposedPorts found in Config/ContainerConfig (normal for many images).");
+      }
 
+      console.log("[ImageRunModal] prefill parsed counts env=%d vol=%d ports=%d",
+        envArr.length, Object.keys(volObj || {}).length, Object.keys(exposed || {}).length);
+
+      // Build UI rows
       const envRows = parseEnvVars(envArr);
-      const volRows = parseVolumes(volObj);
+      const volumeRows = parseVolumes(volObj);
       const portRows = parseExposedPorts(exposed);
 
-      const nextState = {};
-      const hasUserEnv = (this.state.env || []).some(x => x !== undefined);
-      const hasUserVol = (this.state.volumes || []).some(x => x !== undefined);
-      const hasUserPorts = (this.state.publish || []).some(x => x !== undefined);
+      const next = {};
+      if (envRows.length) next.env = envRows;
+      if (volumeRows.length) next.volumes = volumeRows;
+      if (portRows.length) next.publish = portRows;
 
-      if (!hasUserEnv && envRows.length)  nextState.env = envRows;
-      if (!hasUserVol && volRows.length)  nextState.volumes = volRows;
-      if (!hasUserPorts && portRows.length) nextState.publish = portRows;
-
-      if (Object.keys(nextState).length) {
-        nextState.prefillNonce = (this.state.prefillNonce || 0) + 1;
-        LOG("prefill: applying", nextState);
-      } else {
-        LOG("prefill: nothing to apply (maybe user already added rows or image has none)");
+      // If any of them exist, apply them in a single setState so children mount with values.
+      if (Object.keys(next).length) {
+        next.prefillNonce = (this.state.prefillNonce || 0) + 1;
       }
 
-      if (this._isMounted) {
-        this.setState({ ...nextState, prefillLoading: false }, () => {
-          LOG("after prefill setState -> env/vol/publish lengths:",
-              this.state.env?.length, this.state.volumes?.length, this.state.publish?.length);
-        });
-      }
+      console.log("[ImageRunModal] prefill: applying", next);
+
+      if (!this._isMounted) return;
+
+      this.setState(
+        { ...next, prefillLoading: false, prefillReady: true },
+        () => {
+          console.log("[ImageRunModal] after prefill setState -> env/vol/publish lengths:",
+            (this.state.env || []).length,
+            (this.state.volumes || []).length,
+            (this.state.publish || []).length
+          );
+        }
+      );
     } catch (e) {
-      ERR("loadImageDefaults failed:", e);
-      if (this._isMounted) this.setState({ prefillLoading: false });
+      console.warn("[ImageRunModal] loadImageDefaults failed:", e);
+      if (this._isMounted) {
+        this.setState({ prefillLoading: false, prefillReady: true }); // allow UI even if nothing to prefill
+      }
     }
   };
-
-  /* ----------------------- create config ----------------------- */
 
   getCreateConfig() {
     const createConfig = {};
@@ -317,11 +320,13 @@ export class ImageRunModal extends React.Component {
       createConfig.HostConfig.mounts = this.state.volumes
         .filter(volume => volume?.hostPath && volume?.containerPath)
         .map(volume => {
+          // tolerate either readOnly or ReadOnly coming from row component
+          const ro = typeof volume.readOnly === "boolean" ? volume.readOnly : volume.ReadOnly;
           return {
             Source: volume.hostPath,
             Target: volume.containerPath,
             Type: "bind",
-            ReadOnly: volume.ReadOnly
+            ReadOnly: !!ro,
           };
         });
     }
@@ -353,7 +358,7 @@ export class ImageRunModal extends React.Component {
       createConfig.health_check_on_failure_action = parseInt(this.state.healthcheck_action);
     }
 
-    LOG("createConfig built:", createConfig);
+    console.log("createConfig", createConfig);
     return createConfig;
   }
 
@@ -392,7 +397,13 @@ export class ImageRunModal extends React.Component {
   };
 
   async onCreateClicked(runImage = false) {
-    if (!await this.validateForm()) return;
+    if (this.state.prefillLoading) {
+      console.log("[ImageRunModal] create blocked: still loading defaults");
+      return;
+    }
+
+    if (!await this.validateForm())
+      return;
 
     const Dialogs = this.props.dialogs;
     const createConfig = this.getCreateConfig();
@@ -439,17 +450,15 @@ export class ImageRunModal extends React.Component {
             this.props.onAddNotification({ type: 'danger', error, errorDetail: ex.reason });
           });
       })
-      .catch(ex => {
-        onDownloadContainerFinished(createConfig);
-        const error = cockpit.format(_("Failed to pull image $0"), tempImage.image);
-        this.props.onAddNotification({ type: 'danger', error, errorDetail: ex.message });
-      });
+        .catch(ex => {
+          onDownloadContainerFinished(createConfig);
+          const error = cockpit.format(_("Failed to pull image $0"), tempImage.image);
+          this.props.onAddNotification({ type: 'danger', error, errorDetail: ex.message });
+        });
     }
   }
 
   onValueChanged(key, value) {
-    // noisy setState logger
-    LOG("setState:", key, "->", value);
     this.setState({ [key]: value });
   }
 
@@ -467,10 +476,13 @@ export class ImageRunModal extends React.Component {
   };
 
   onSearchTriggered = value => {
-    if (value.length < 2) return;
+    if (value.length < 2)
+      return;
 
     const patt = /:[\w|\d]+$/;
-    if (patt.test(value)) return;
+    if (patt.test(value)) {
+      return;
+    }
 
     const selectedIndex = this.state.searchByRegistry;
     const targetGhcr = selectedIndex === 'ghcr.io' || isGhcrVersaNodeTerm(value);
@@ -480,7 +492,8 @@ export class ImageRunModal extends React.Component {
         ? { "ghcr.io": [{ Name: name, Description: "GitHub Container Registry (versa-node)" }] }
         : { "ghcr.io": [] };
 
-      if (this.activeConnection) this.activeConnection.close();
+      if (this.activeConnection)
+        this.activeConnection.close();
 
       this.setState({
         imageResults: images,
@@ -492,7 +505,8 @@ export class ImageRunModal extends React.Component {
       return;
     }
 
-    if (this.activeConnection) this.activeConnection.close();
+    if (this.activeConnection)
+      this.activeConnection.close();
 
     this.setState({ searchFinished: false, searchInProgress: true });
     this.activeConnection = rest.connect(client.getAddress());
@@ -592,11 +606,12 @@ export class ImageRunModal extends React.Component {
       command,
       entrypoint,
     }, () => {
-      LOG("image selected:", value);
+      // Prefill if the selected is a local image, and wait for it
       if (isLocalImageRef(value, this.props.localImages || [])) {
         this.loadImageDefaults(value);
       } else {
-        LOG("selected image appears remote/non-local; skipping prefill until pulled");
+        // non-local selection: no prefill -> mark ready
+        this.setState({ prefillReady: true });
       }
     });
   };
@@ -612,65 +627,6 @@ export class ImageRunModal extends React.Component {
 
   debouncedInputChanged = debounce(300, this.handleImageSelectInput);
 
-  handleOwnerSelect = (event) => {
-    const value = event.currentTarget.value;
-    this.setState({ owner: value });
-  };
-
-  filterImages = () => {
-    const { localImages } = this.props;
-    const { imageResults, searchText } = this.state;
-    const local = _("Local images");
-    const images = { ...imageResults };
-
-    let imageRegistries = [];
-    if (this.state.searchByRegistry == 'local' || this.state.searchByRegistry == 'all') {
-      imageRegistries.push(local);
-      images[local] = localImages;
-
-      if (this.state.searchByRegistry == 'all')
-        imageRegistries = imageRegistries.concat(Object.keys(imageResults));
-    } else {
-      imageRegistries.push(this.state.searchByRegistry);
-    }
-
-    let regexString = searchText.replace(/[^\w_.:-]/g, "");
-    if (regexString.includes('/')) {
-      regexString = searchText.replace(searchText.split('/')[0], '');
-    }
-    const input = new RegExp(regexString, 'i');
-
-    const results = imageRegistries
-      .map((reg, index) => {
-        const filtered = (reg in images ? images[reg] : [])
-          .filter(image => image.Name.search(input) !== -1)
-          .map((image, idx) => (
-            <SelectOption
-              key={idx}
-              value={image}
-              {...(image.Description && { description: image.Description })}
-            />
-          ));
-
-        if (filtered.length === 0) {
-          return [];
-        } else {
-          return (
-            <SelectGroup label={reg} key={index} value={reg}>
-              {filtered}
-            </SelectGroup>
-          );
-        }
-      })
-      .filter(group => group.length !== 0);
-
-    if (this.state.searchByRegistry !== 'all' && imageRegistries.length === 1 && results.length === 1) {
-      return results[0].props.children;
-    }
-
-    return results;
-  };
-
   truncateRegistryDomain = (domain) => {
     const parts = domain.split('.');
     if (parts.length > 2) {
@@ -681,6 +637,7 @@ export class ImageRunModal extends React.Component {
 
   enableDockerRestartService = () => {
     const argv = ["systemctl", "enable", "docker.service"];
+
     cockpit.spawn(argv, { superuser: "require", err: "message" })
       .catch(err => {
         console.warn("Failed to enable docker.service:", JSON.stringify(err));
@@ -754,10 +711,67 @@ export class ImageRunModal extends React.Component {
 
   dynamicListOnValidationChange = (key, value) => {
     const validationFailedDelta = { ...this.state.validationFailed };
+
     validationFailedDelta[key] = value;
+
     if (validationFailedDelta[key].every(a => a === undefined))
       delete validationFailedDelta[key];
+
     this.onValueChanged('validationFailed', validationFailedDelta);
+  };
+
+  filterImages = () => {
+    const { localImages } = this.props;
+    const { imageResults, searchText } = this.state;
+    const local = _("Local images");
+    const images = { ...imageResults };
+
+    let imageRegistries = [];
+    if (this.state.searchByRegistry == 'local' || this.state.searchByRegistry == 'all') {
+      imageRegistries.push(local);
+      images[local] = localImages;
+
+      if (this.state.searchByRegistry == 'all')
+        imageRegistries = imageRegistries.concat(Object.keys(imageResults));
+    } else {
+      imageRegistries.push(this.state.searchByRegistry);
+    }
+
+    let regexString = searchText.replace(/[^\w_.:-]/g, "");
+    if (regexString.includes('/')) {
+      regexString = searchText.replace(searchText.split('/')[0], '');
+    }
+    const input = new RegExp(regexString, 'i');
+
+    const results = imageRegistries
+      .map((reg, index) => {
+        const filtered = (reg in images ? images[reg] : [])
+          .filter(image => image.Name.search(input) !== -1)
+          .map((image, idx) => (
+            <SelectOption
+              key={idx}
+              value={image}
+              {...(image.Description && { description: image.Description })}
+            />
+          ));
+
+        if (filtered.length === 0) {
+          return [];
+        } else {
+          return (
+            <SelectGroup label={reg} key={index} value={reg}>
+              {filtered}
+            </SelectGroup>
+          );
+        }
+      })
+      .filter(group => group.length !== 0);
+
+    if (this.state.searchByRegistry !== 'all' && imageRegistries.length === 1 && results.length === 1) {
+      return results[0].props.children;
+    }
+
+    return results;
   };
 
   render() {
@@ -912,58 +926,64 @@ export class ImageRunModal extends React.Component {
           </Tab>
 
           <Tab eventKey={1} title={<TabTitleText>{_("Integration")}</TabTitleText>} id="create-image-dialog-tab-integration" className="pf-v5-c-form">
+            {/* hint + gate while defaults are loading */}
             {this.state.prefillLoading && (
               <div className="pf-v5-c-helper-text pf-m-inline">
                 {_("Loading defaults from image…")}
               </div>
             )}
 
-            <DynamicListForm
-              key={`publish-${this.state.prefillNonce}`}
-              id='run-image-dialog-publish'
-              emptyStateString={_("No ports exposed")}
-              formclass='publish-port-form'
-              label={_("Port mapping")}
-              actionLabel={_("Add port mapping")}
-              validationFailed={dialogValues.validationFailed.publish}
-              onValidationChange={value => this.dynamicListOnValidationChange('publish', value)}
-              onChange={value => this.onValueChanged('publish', value)}
-              value={dialogValues.publish}
-              default={{ IP: null, containerPort: null, hostPort: null, protocol: 'tcp' }}
-              itemcomponent={<PublishPort />}
-            />
+            {/* Only render lists after prefillReady (so they mount with rows already present) */}
+            {this.state.prefillReady && (
+              <>
+                <DynamicListForm
+                  key={`publish-${this.state.prefillNonce}`}
+                  id='run-image-dialog-publish'
+                  emptyStateString={_("No ports exposed")}
+                  formclass='publish-port-form'
+                  label={_("Port mapping")}
+                  actionLabel={_("Add port mapping")}
+                  validationFailed={dialogValues.validationFailed.publish}
+                  onValidationChange={value => this.dynamicListOnValidationChange('publish', value)}
+                  onChange={value => this.onValueChanged('publish', value)}
+                  value={dialogValues.publish}
+                  default={{ IP: null, containerPort: null, hostPort: null, protocol: 'tcp' }}
+                  itemcomponent={<PublishPort />}
+                />
 
-            <DynamicListForm
-              key={`volumes-${this.state.prefillNonce}`}
-              id='run-image-dialog-volume'
-              emptyStateString={_("No volumes specified")}
-              formclass='volume-form'
-              label={_("Volumes")}
-              actionLabel={_("Add volume")}
-              validationFailed={dialogValues.validationFailed.volumes}
-              onValidationChange={value => this.dynamicListOnValidationChange('volumes', value)}
-              onChange={value => this.onValueChanged('volumes', value)}
-              value={dialogValues.volumes}
-              default={{ containerPath: null, hostPath: null, readOnly: false }}
-              options={{ selinuxAvailable }}
-              itemcomponent={<Volume />}
-            />
+                <DynamicListForm
+                  key={`volumes-${this.state.prefillNonce}`}
+                  id='run-image-dialog-volume'
+                  emptyStateString={_("No volumes specified")}
+                  formclass='volume-form'
+                  label={_("Volumes")}
+                  actionLabel={_("Add volume")}
+                  validationFailed={dialogValues.validationFailed.volumes}
+                  onValidationChange={value => this.dynamicListOnValidationChange('volumes', value)}
+                  onChange={value => this.onValueChanged('volumes', value)}
+                  value={dialogValues.volumes}
+                  default={{ containerPath: null, hostPath: null, readOnly: false }}
+                  options={{ selinuxAvailable }}
+                  itemcomponent={<Volume />}
+                />
 
-            <DynamicListForm
-              key={`env-${this.state.prefillNonce}`}
-              id='run-image-dialog-env'
-              emptyStateString={_("No environment variables specified")}
-              formclass='env-form'
-              label={_("Environment variables")}
-              actionLabel={_("Add variable")}
-              validationFailed={dialogValues.validationFailed.env}
-              onValidationChange={value => this.dynamicListOnValidationChange('env', value)}
-              onChange={value => this.onValueChanged('env', value)}
-              value={dialogValues.env}
-              default={{ envKey: null, envValue: null }}
-              helperText={_("Paste one or more lines of key=value pairs into any field for bulk import")}
-              itemcomponent={<EnvVar />}
-            />
+                <DynamicListForm
+                  key={`env-${this.state.prefillNonce}`}
+                  id='run-image-dialog-env'
+                  emptyStateString={_("No environment variables specified")}
+                  formclass='env-form'
+                  label={_("Environment variables")}
+                  actionLabel={_("Add variable")}
+                  validationFailed={dialogValues.validationFailed.env}
+                  onValidationChange={value => this.dynamicListOnValidationChange('env', value)}
+                  onChange={value => this.onValueChanged('env', value)}
+                  value={dialogValues.env}
+                  default={{ envKey: null, envValue: null }}
+                  helperText={_("Paste one or more lines of key=value pairs into any field for bulk import")}
+                  itemcomponent={<EnvVar />}
+                />
+              </>
+            )}
           </Tab>
 
           <Tab eventKey={2} title={<TabTitleText>{_("Health check")}</TabTitleText>} id="create-image-dialog-tab-healthcheck" className="pf-v5-c-form pf-m-horizontal">
@@ -1164,7 +1184,7 @@ export class ImageRunModal extends React.Component {
               variant='primary'
               id="create-image-create-run-btn"
               onClick={() => this.onCreateClicked(true)}
-              isDisabled={(!image && selectedImage === "") || this.isFormInvalid(dialogValues.validationFailed)}
+              isDisabled={this.state.prefillLoading || (!image && selectedImage === "") || this.isFormInvalid(dialogValues.validationFailed)}
             >
               {_("Create and run")}
             </Button>
@@ -1172,7 +1192,7 @@ export class ImageRunModal extends React.Component {
               variant='secondary'
               id="create-image-create-btn"
               onClick={() => this.onCreateClicked(false)}
-              isDisabled={(!image && selectedImage === "") || this.isFormInvalid(dialogValues.validationFailed)}
+              isDisabled={this.state.prefillLoading || (!image && selectedImage === "") || this.isFormInvalid(dialogValues.validationFailed)}
             >
               {_("Create")}
             </Button>

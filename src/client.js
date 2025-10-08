@@ -1,3 +1,4 @@
+// client.js
 import rest from './rest.js';
 
 const DOCKER_ADDRESS = "/var/run/docker.sock";
@@ -23,8 +24,8 @@ function dockerCall(name, method, args, body) {
     return rest.call(getAddress(), options);
 }
 
-const dockerJson = (name, method, args, body) => dockerCall(name, method, args, body)
-        .then(reply => JSON.parse(reply));
+const dockerJson = (name, method, args, body) =>
+    dockerCall(name, method, args, body).then(reply => JSON.parse(reply));
 
 function dockerMonitor(name, method, args, callback) {
     const options = {
@@ -46,21 +47,27 @@ export function getInfo() {
     return new Promise((resolve, reject) => {
         const timeout = setTimeout(() => reject(new Error("timeout")), 15000);
         dockerJson("/info", "GET", {})
-                .then(reply => resolve(reply))
-                .catch(reject)
-                .finally(() => clearTimeout(timeout));
+            .then(reply => resolve(reply))
+            .catch(reject)
+            .finally(() => clearTimeout(timeout));
     });
 }
 
 export const getContainers = () => dockerJson("/containers/json", "GET", { all: true });
 
-export const streamContainerStats = (id, callback) => dockerMonitor("/containers/" + id + "/stats", "GET", { stream: true }, callback);
+export const streamContainerStats = (id, callback) =>
+    dockerMonitor("/containers/" + id + "/stats", "GET", { stream: true }, callback);
 
 export function inspectContainer(id) {
     const options = {
         size: false // set true to display filesystem usage
     };
     return dockerJson("/containers/" + id + "/json", "GET", options);
+}
+
+/** NEW: Inspect an image by ID or reference (e.g. repo:tag). */
+export function inspectImage(ref) {
+    return dockerJson("/images/" + encodeURIComponent(ref) + "/json", "GET", {});
 }
 
 export const delContainer = (id, force) => dockerCall("/containers/" + id, "DELETE", { force });
@@ -102,12 +109,23 @@ export function resizeContainersTTY(id, exec, width, height) {
 function parseImageInfo(info) {
     const image = {};
 
-    if (info.Config) {
-        image.Entrypoint = info.Config.Entrypoint;
-        image.Command = info.Config.Cmd;
-        image.Ports = Object.keys(info.Config.ExposedPorts || {});
-        image.Env = info.Config.Env;
+    // Prefer Config.*; fall back to ContainerConfig for ExposedPorts
+    const cfg = info?.Config || {};
+    const containerCfg = info?.ContainerConfig || {};
+
+    if (cfg) {
+        image.Entrypoint = cfg.Entrypoint;
+        image.Command = cfg.Cmd;
+        image.Env = cfg.Env;
+
+        // Preserve the full objects so callers can prefill rich UIs
+        const exposed = cfg.ExposedPorts || containerCfg.ExposedPorts || {};
+        image.ExposedPorts = exposed || {};
+        image.Ports = Object.keys(exposed || {}); // backward-compat: array of "port/proto"
+
+        image.Volumes = cfg.Volumes || {}; // NEW: volumes map from the image config
     }
+
     image.Author = info.Author;
 
     return image;
@@ -117,24 +135,25 @@ export function getImages(id) {
     const options = {};
     if (id)
         options.filters = JSON.stringify({ id: [id] });
+
     return dockerJson("/images/json", "GET", options)
-            .then(reply => {
-                const images = {};
-                const promises = [];
+        .then(reply => {
+            const images = {};
+            const promises = [];
 
-                for (const image of reply) {
-                    images[image.Id] = image;
-                    promises.push(dockerJson("/images/" + image.Id + "/json", "GET", {}));
-                }
+            for (const image of reply) {
+                images[image.Id] = image;
+                promises.push(dockerJson("/images/" + image.Id + "/json", "GET", {}));
+            }
 
-                return Promise.all(promises)
-                        .then(replies => {
-                            for (const info of replies) {
-                                images[info.Id] = Object.assign(images[info.Id], parseImageInfo(info));
-                            }
-                            return images;
-                        });
-            });
+            return Promise.all(promises)
+                .then(replies => {
+                    for (const info of replies) {
+                        images[info.Id] = Object.assign(images[info.Id], parseImageInfo(info));
+                    }
+                    return images;
+                });
+        });
 }
 
 export const delImage = (id, force) => dockerJson("/images/" + id, "DELETE", { force });
@@ -147,19 +166,19 @@ export function pullImage(reference) {
             fromImage: reference,
         };
         dockerCall("/images/create", "POST", options)
-                .then(r => {
-                    // Need to check the last response if it contains error
-                    const responses = r.trim().split("\n");
-                    const response = JSON.parse(responses[responses.length - 1]);
-                    if (response.error) {
-                        response.message = response.error;
-                        reject(response);
-                    } else if (response.cause) // present for 400 and 500 errors
-                        reject(response);
-                    else
-                        resolve();
-                })
-                .catch(reject);
+            .then(r => {
+                // Need to check the last response if it contains error
+                const responses = r.trim().split("\n");
+                const response = JSON.parse(responses[responses.length - 1]);
+                if (response.error) {
+                    response.message = response.error;
+                    reject(response);
+                } else if (response.cause) // present for 400 and 500 errors
+                    reject(response);
+                else
+                    resolve();
+            })
+            .catch(reject);
     });
 }
 
