@@ -306,16 +306,16 @@ export class ImageRunModal extends React.Component {
         }
 
         if (this.state.volumes.some(volume => volume !== undefined)) {
-            createConfig.HostConfig.mounts = this.state.volumes
-                .filter(volume => volume?.hostPath && volume?.containerPath)
-                .map(volume => {
-                    return {
-                        Source: volume.hostPath,
-                        Target: volume.containerPath,
-                        Type: "bind",
-                        ReadOnly: volume.ReadOnly
-                    };
-                });
+         createConfig.HostConfig.Mounts = this.state.volumes
+          .filter(volume => volume?.hostPath && volume?.containerPath)
+          .map(volume => {
+              return {
+                  Source: volume.hostPath,
+                  Target: volume.containerPath,
+                  Type: "bind",
+                  ReadOnly: !!volume.readOnly
+              };
+          });
         }
 
         if (this.state.restartPolicy !== "no") {
