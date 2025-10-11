@@ -414,17 +414,17 @@ export class ImageRunModal extends React.Component {
 
         // Ensure the target network exists (no-op if it does)
         try {
-            const netMode = createConfig?.HostConfig?.NetworkMode;
-            if (netMode && netMode !== "host" && netMode !== "none") {
-                await client.ensureNetwork(netMode);   // will no-op if it already exists
-            }
-            } catch (e) {
-            this.setState({
-                dialogError: _("Failed to ensure network exists"),
-                dialogErrorDetail: e.message || String(e),
-            });
-            return;
-            }
+        const netMode = createConfig?.HostConfig?.NetworkMode;
+        if (netMode && netMode !== "host" && netMode !== "none") {
+            await client.ensureNetwork(netMode);   // will no-op if it already exists
+        }
+        } catch (e) {
+        this.setState({
+            dialogError: _("Failed to ensure network exists"),
+            dialogErrorDetail: e.message || String(e),
+        });
+        return;
+        }
 
 
         try {

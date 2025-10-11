@@ -34,6 +34,9 @@ import PruneUnusedContainersModal from './PruneUnusedContainersModal.jsx';
 
 import { KebabDropdown } from "cockpit-components-dropdown.jsx";
 
+import ContainerInfo from "./ContainerInfo.jsx";
+
+
 const _ = cockpit.gettext;
 
 
@@ -441,6 +444,14 @@ class Containers extends React.Component {
 
         const tabs = [];
         if (container.State) {
+
+            tabs.push({
+                name: _("Info"),
+                renderer: ContainerInfo,
+                data: { container, health: healthcheck }
+            });
+
+            
             tabs.push({
                 name: _("Details"),
                 renderer: ContainerDetails,
@@ -475,7 +486,7 @@ class Containers extends React.Component {
         }
 
         return {
-            expandedContent: <ListingPanel colSpan='4' tabRenderers={tabs} />,
+            expandedContent: <ListingPanel colSpan='5' tabRenderers={tabs} />,
             columns,
             initiallyExpanded: document.location.hash.substr(1) === container.Id,
             props: {
