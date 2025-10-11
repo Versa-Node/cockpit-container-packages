@@ -3,6 +3,7 @@ import rest from './rest.js';
 
 const DOCKER_ADDRESS = "/var/run/docker.sock";
 export const VERSION = "/v1.43";
+
 export function listNetworks(filtersObj = null) {
   const params = {};
   if (filtersObj) params.filters = JSON.stringify(filtersObj);
@@ -38,6 +39,10 @@ export async function ensureNetwork(name) {
   await createNetwork(name, "bridge");
 }
 
+
+export function getAddress() {
+    return DOCKER_ADDRESS;
+}
 
 function dockerCall(name, method, args, body) {
     const options = {
