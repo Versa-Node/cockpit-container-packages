@@ -3,28 +3,41 @@ import rest from './rest.js';
 
 const DOCKER_ADDRESS = "/var/run/docker.sock";
 export const VERSION = "/v1.43";
+export function listNetworks(filtersObj = null) {
+  const params = {};
+  if (filtersObj) params.filters = JSON.stringify(filtersObj);
+  return dockerJson("/networks", "GET", params);
+}
 
-export const listNetworks = () => dockerJson("/networks", "GET", {});
+export function inspectNetwork(nameOrId) {
+  return dockerJson("/networks/" + encodeURIComponent(nameOrId), "GET", {});
+}
 
-export const createNetwork = (name, opts = {}) =>
-  dockerJson("/networks/create", "POST", {}, JSON.stringify({
+export function createNetwork(name, driver = "bridge") {
+  const body = {
     Name: name,
-    Driver: "bridge",
+    Driver: driver,
     CheckDuplicate: true,
-    ...opts,            // e.g. { "Internal": false, "Attachable": true }
-  }));
+    Internal: false,
+    Attachable: true,
+  };
+  return dockerJson("/networks/create", "POST", {}, JSON.stringify(body));
+}
 
 export async function ensureNetwork(name) {
-  const nets = await listNetworks();
-  const found = nets.find(n => n?.Name === name);
-  if (!found) {
-    await createNetwork(name, { Attachable: true });
+  try {
+    await inspectNetwork(name);
+    return; // exists
+  } catch (e) {
+    // If it's a 404-style error, create it; otherwise rethrow
+    // (Docker socket proxy sometimes returns text; be forgiving)
+    const msg = (e && (e.message || e.reason)) ? String(e.message || e.reason) : "";
+    const isNotFound = /404|not\s*found/i.test(msg);
+    if (!isNotFound) throw e;
   }
+  await createNetwork(name, "bridge");
 }
 
-export function getAddress() {
-    return DOCKER_ADDRESS;
-}
 
 function dockerCall(name, method, args, body) {
     const options = {

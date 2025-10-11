@@ -155,7 +155,8 @@ export class ImageRunModal extends React.Component {
             /* prefill */
             prefillLoading: false,
             prefillNonce: 0, // bump to force DynamicListForm remount
-            useHostNetwork: false
+            useHostNetwork: false,
+            networkName: "versanode"
         };
         this.getCreateConfig = this.getCreateConfig.bind(this);
         this.onValueChanged = this.onValueChanged.bind(this);
@@ -347,24 +348,18 @@ export class ImageRunModal extends React.Component {
         }
 
         // --- Networking ---
-        const NET = "versanode";
-
         if (this.state.useHostNetwork) {
-        // NEW: host networking (same as `--network host`)
         createConfig.HostConfig.NetworkMode = "host";
-
-        // Host network ignores published/bound ports; make sure we don't send bindings
         delete createConfig.HostConfig.PortBindings;
         delete createConfig.ExposedPorts;
         delete createConfig.NetworkingConfig;
         } else {
-        // Bridge user network (same as `--network versanode`)
+        const NET = this.state.networkName || "versanode";
         createConfig.HostConfig.NetworkMode = NET;
         createConfig.NetworkingConfig = {
             EndpointsConfig: {
             [NET]: {
                 // Aliases: [this.state.containerName],
-                // IPAMConfig: { IPv4Address: "172.28.0.10" },
             },
             },
         };
@@ -421,15 +416,16 @@ export class ImageRunModal extends React.Component {
         try {
             const netMode = createConfig?.HostConfig?.NetworkMode;
             if (netMode && netMode !== "host" && netMode !== "none") {
-            await client.ensureNetwork(netMode);
+                await client.ensureNetwork(netMode);   // will no-op if it already exists
             }
-        } catch (e) {
+            } catch (e) {
             this.setState({
-            dialogError: _("Failed to ensure network exists"),
-            dialogErrorDetail: e.message || String(e),
+                dialogError: _("Failed to ensure network exists"),
+                dialogErrorDetail: e.message || String(e),
             });
             return;
-        }
+            }
+
 
         try {
             await client.imageExists(createConfig.image);
@@ -781,6 +777,16 @@ export class ImageRunModal extends React.Component {
         if (containerNameValidation)
             validationFailed.containerName = containerNameValidation;
 
+        // simple network name check when not using host networking
+        if (!this.state.useHostNetwork) {
+        const n = (this.state.networkName || "").trim();
+        if (!n) {
+            validationFailed.networkName = _("Network name is required when not using host network");
+        } else if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]+$/.test(n)) {
+            validationFailed.networkName = _("Invalid network name (allowed: letters, numbers, . _ -)");
+        }
+        }
+
         this.setState({ validationFailed });
 
         return !this.isFormInvalid(validationFailed);
@@ -951,13 +957,27 @@ export class ImageRunModal extends React.Component {
                         <Checkbox
                             id="run-image-dialog-hostnet"
                             isChecked={this.state.useHostNetwork}
-                            label={_("Use host network (Linux only)")}
+                            label={_("Use host network")}
                             description={_("Ignores port mappings; container shares the host’s network namespace.")}
                             onChange={(_event, checked) => this.onValueChanged('useHostNetwork', checked)}
                         />
                         </FormGroup>
-
-
+                        {!this.state.useHostNetwork && (
+                        <FormGroup
+                            fieldId="run-image-dialog-network-name"
+                            label={_("Docker network")}
+                            helperTextInvalid={dialogValues.validationFailed.networkName}
+                            validated={dialogValues.validationFailed.networkName ? "error" : "default"}
+                        >
+                            <TextInput
+                            id="run-image-dialog-network-name"
+                            value={this.state.networkName}
+                            onChange={(_, val) => this.onValueChanged("networkName", (val || "").trim())}
+                            placeholder="versanode"
+                            validated={dialogValues.validationFailed.networkName ? "error" : "default"}
+                            />
+                        </FormGroup>
+                        )}
                         <FormGroup fieldId='run-image-dialog-memory' label={_("Memory limit")}>
                             <Flex alignItems={{ default: 'alignItemsCenter' }} className="ct-input-group-spacer-sm modal-run-limiter" id="run-image-dialog-memory-limit">
                                 <Checkbox

@@ -36,6 +36,85 @@ import { KebabDropdown } from "cockpit-components-dropdown.jsx";
 
 const _ = cockpit.gettext;
 
+
+// --- Dashboards viewer for a single container --- //
+// Reads /var/lib/docker/volumes/<vol-id>/_data/props/vncp-info.json
+// where that volume is the one mounted at /vncp inside the container.
+const DashboardLinks = ({ container }) => {
+  const [dashboards, setDashboards] = React.useState(null);
+  const [error, setError] = React.useState(null);
+  const fileRef = React.useRef(null);
+
+  React.useEffect(() => {
+    try {
+      const mounts = container?.Mounts || [];
+      const vncpMount = mounts.find(m => (m.Destination === "/vncp" || (m.Destination || "").endsWith("/vncp")));
+      if (!vncpMount || !vncpMount.Source) {
+        setDashboards([]); // nothing to show
+        return;
+      }
+
+      // Host path to vncp-info.json:
+      //   <source>/_data/props/vncp-info.json
+      // NOTE: Docker named volumes show Source=/var/lib/docker/volumes/<id>/_data
+      const base = vncpMount.Source;
+      const infoPath = `${base.replace(/\/+$/,'')}/props/vncp-info.json`;
+
+      // Use cockpit.file so we can "watch" updates (when container becomes healthy later).
+      const f = cockpit.file(infoPath, { superuser: "try" });
+      fileRef.current = f;
+
+      const stop = f.watch((content, _tag, err) => {
+        if (err) {
+          // file may not exist yet; don’t be noisy
+          setError(null);
+          setDashboards([]); // empty for now
+          return;
+        }
+        try {
+          const json = content ? JSON.parse(content) : null;
+          const list = json?.dashboards || [];
+          setError(null);
+          setDashboards(Array.isArray(list) ? list : []);
+        } catch (e) {
+          setError("Invalid JSON");
+          setDashboards([]);
+        }
+      });
+
+      return () => {
+        try { stop && stop(); } catch (_) {}
+        try { fileRef.current && fileRef.current.close(); } catch (_) {}
+      };
+    } catch (e) {
+      setError(String(e));
+      setDashboards([]);
+    }
+  }, [container?.Id]);
+
+  if (error) return <span title={error}>—</span>;
+  if (!dashboards || dashboards.length === 0) return <span>—</span>;
+
+  return (
+    <LabelGroup isVertical>
+      {dashboards.map((d, idx) => (
+        <Button
+          key={`${d.name || d.url}-${idx}`}
+          variant="link"
+          isInline
+          component="a"
+          href={d.url}
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          {d.name || d.url}
+        </Button>
+      ))}
+    </LabelGroup>
+  );
+};
+
+
 const ContainerActions = ({ container, healthcheck, onAddNotification, localImages, updateContainer }) => {
     const Dialogs = useDialogs();
     const { version } = utils.useDockerInfo();
@@ -342,6 +421,11 @@ class Containers extends React.Component {
             { title: <LabelGroup isVertical>{state}</LabelGroup>, sortKey: containerState },
         ];
 
+        columns.push({
+        title: <DashboardLinks container={container} />,
+        sortKey: "", // not sortable; or add custom if you wish
+        });
+
         if (!container.isDownloading) {
             columns.push({
                 title: <ContainerActions container={container}
@@ -417,6 +501,7 @@ class Containers extends React.Component {
             { title: _("CPU"), sortable: true },
             { title: _("Memory"), sortable: true },
             { title: _("State"), sortable: true },
+            { title: _("Dashboards") },
             ''
         ];
         let filtered = [];
