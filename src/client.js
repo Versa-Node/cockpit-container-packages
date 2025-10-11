@@ -4,6 +4,24 @@ import rest from './rest.js';
 const DOCKER_ADDRESS = "/var/run/docker.sock";
 export const VERSION = "/v1.43";
 
+export const listNetworks = () => dockerJson("/networks", "GET", {});
+
+export const createNetwork = (name, opts = {}) =>
+  dockerJson("/networks/create", "POST", {}, JSON.stringify({
+    Name: name,
+    Driver: "bridge",
+    CheckDuplicate: true,
+    ...opts,            // e.g. { "Internal": false, "Attachable": true }
+  }));
+
+export async function ensureNetwork(name) {
+  const nets = await listNetworks();
+  const found = nets.find(n => n?.Name === name);
+  if (!found) {
+    await createNetwork(name, { Attachable: true });
+  }
+}
+
 export function getAddress() {
     return DOCKER_ADDRESS;
 }

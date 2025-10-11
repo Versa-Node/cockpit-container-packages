@@ -155,6 +155,7 @@ export class ImageRunModal extends React.Component {
             /* prefill */
             prefillLoading: false,
             prefillNonce: 0, // bump to force DynamicListForm remount
+            useHostNetwork: false
         };
         this.getCreateConfig = this.getCreateConfig.bind(this);
         this.onValueChanged = this.onValueChanged.bind(this);
@@ -345,7 +346,30 @@ export class ImageRunModal extends React.Component {
             createConfig.health_check_on_failure_action = parseInt(this.state.healthcheck_action);
         }
 
-        console.log("createConfig", createConfig);
+        // --- Networking ---
+        const NET = "versanode";
+
+        if (this.state.useHostNetwork) {
+        // NEW: host networking (same as `--network host`)
+        createConfig.HostConfig.NetworkMode = "host";
+
+        // Host network ignores published/bound ports; make sure we don't send bindings
+        delete createConfig.HostConfig.PortBindings;
+        delete createConfig.ExposedPorts;
+        delete createConfig.NetworkingConfig;
+        } else {
+        // Bridge user network (same as `--network versanode`)
+        createConfig.HostConfig.NetworkMode = NET;
+        createConfig.NetworkingConfig = {
+            EndpointsConfig: {
+            [NET]: {
+                // Aliases: [this.state.containerName],
+                // IPAMConfig: { IPv4Address: "172.28.0.10" },
+            },
+            },
+        };
+        }
+
         return createConfig;
     }
 
@@ -391,6 +415,21 @@ export class ImageRunModal extends React.Component {
         const createConfig = this.getCreateConfig();
         const { pullLatestImage } = this.state;
         let imageExists = true;
+
+
+        // Ensure the target network exists (no-op if it does)
+        try {
+            const netMode = createConfig?.HostConfig?.NetworkMode;
+            if (netMode && netMode !== "host" && netMode !== "none") {
+            await client.ensureNetwork(netMode);
+            }
+        } catch (e) {
+            this.setState({
+            dialogError: _("Failed to ensure network exists"),
+            dialogErrorDetail: e.message || String(e),
+            });
+            return;
+        }
 
         try {
             await client.imageExists(createConfig.image);
@@ -908,6 +947,17 @@ export class ImageRunModal extends React.Component {
                             />
                         </FormGroup>
 
+                        <FormGroup fieldId="run-image-dialog-hostnet">
+                        <Checkbox
+                            id="run-image-dialog-hostnet"
+                            isChecked={this.state.useHostNetwork}
+                            label={_("Use host network (Linux only)")}
+                            description={_("Ignores port mappings; container shares the host’s network namespace.")}
+                            onChange={(_event, checked) => this.onValueChanged('useHostNetwork', checked)}
+                        />
+                        </FormGroup>
+
+
                         <FormGroup fieldId='run-image-dialog-memory' label={_("Memory limit")}>
                             <Flex alignItems={{ default: 'alignItemsCenter' }} className="ct-input-group-spacer-sm modal-run-limiter" id="run-image-dialog-memory-limit">
                                 <Checkbox
@@ -1048,10 +1098,14 @@ export class ImageRunModal extends React.Component {
                             validationFailed={dialogValues.validationFailed.publish}
                             onValidationChange={value => this.dynamicListOnValidationChange('publish', value)}
                             onChange={value => this.onValueChanged('publish', value)}
-                            value={dialogValues.publish}      // ← hydrate from here
+                            value={dialogValues.publish}
                             default={{ IP: null, containerPort: null, hostPort: null, protocol: 'tcp' }}
                             itemcomponent={PublishPort}
-                        />
+                            isDisabled={this.state.useHostNetwork}
+                            helperText={this.state.useHostNetwork
+                                ? _("Host network is enabled; port mappings are ignored.")
+                                : undefined}
+                            />
 
                         <DynamicListForm
                             key={`volumes-${this.state.prefillNonce}`}
