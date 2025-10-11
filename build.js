@@ -2,6 +2,7 @@
 
 import fs from 'node:fs';
 import os from 'node:os';
+import path from 'node:path';
 
 import copy from 'esbuild-plugin-copy';
 
@@ -49,17 +50,37 @@ function notifyEndPlugin() {
     };
 }
 
+/**
+ * Only treat our own source files as JSX.
+ * Prevents node_modules (e.g. react-markdown/remark deps) from being parsed as JSX.
+ */
+function jsxOnlyInSrcPlugin() {
+    return {
+        name: 'jsx-only-in-src',
+        setup(build) {
+            build.onLoad({ filter: /\.js$/ }, async (args) => {
+                const rel = path.relative(process.cwd(), args.path);
+                if (!rel.startsWith(`src${path.sep}`)) return null; // leave node_modules/default handling
+                const contents = await fs.promises.readFile(args.path, 'utf8');
+                return { contents, loader: 'jsx' };
+            });
+        }
+    };
+}
+
 const context = await esbuild.context({
     ...!production ? { sourcemap: "linked" } : {},
     bundle: true,
     entryPoints: ["./src/index.js"],
     external: ['*.woff', '*.woff2', '*.jpg', '*.svg', '../../assets*'], // Allow external font files which live in ../../static/fonts
     legalComments: 'external', // Move all legal comments to a .LEGAL.txt file
-    loader: { ".js": "jsx" },
     minify: production,
     nodePaths,
     outdir,
     target: ['es2020'],
+    define: {
+        'process.env.NODE_ENV': JSON.stringify(production ? 'production' : 'development'),
+    },
     plugins: [
         cleanPlugin(),
         // Esbuild will only copy assets that are explicitly imported and used
@@ -70,6 +91,7 @@ const context = await esbuild.context({
                 { from: ['./src/index.html'], to: ['./index.html'] },
             ]
         }),
+        jsxOnlyInSrcPlugin(),
         ...esbuildStylesPlugins,
         cockpitPoEsbuildPlugin(),
 
@@ -91,11 +113,11 @@ try {
 
 if (args.watch) {
     // Attention: this does not watch subdirectories -- if you ever introduce one, need to set up one watch per subdir
-    fs.watch('src', {}, async (ev, path) => {
+    fs.watch('src', {}, async (ev, pathChanged) => {
         // only listen for "change" events, as renames are noisy
         if (ev !== "change")
             return;
-        console.log("change detected:", path);
+        console.log("change detected:", pathChanged);
         await context.cancel();
         try {
             await context.rebuild();
